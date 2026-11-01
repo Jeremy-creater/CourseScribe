@@ -8,18 +8,28 @@ version = "0.1.0"
 description = "Record a course or pick a media file, and get a full proofread transcript. Runs locally."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+  "faster-whisper>=1.2,<2",
+  "numpy>=2,<3",
+  "platformdirs>=4.3,<5",
+  "PySide6-Essentials>=6.8,<7",
+  "soundcard>=0.4.6,<1; sys_platform == 'win32'",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3", "pytest-cov>=5"]
+dev = ["pytest>=8.3", "pytest-cov>=5", "pyinstaller>=6.19,<7"]
+gpu = [
+  "nvidia-cublas-cu12>=12.6,<13; sys_platform == 'win32'",
+  "nvidia-cudnn-cu12>=9.5,<10; sys_platform == 'win32'",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
-addopts = "--strict-markers"
+pythonpath = ["src", "tests"]
+addopts = "--strict-markers -p pytester"
 markers = [
   "engine: real in-process transcription model, no external services",
   "integration: real running Ollama service",
