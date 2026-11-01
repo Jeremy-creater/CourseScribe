@@ -9,6 +9,7 @@ description = "Record a course or pick a media file, and get a full proofread tr
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+  "av>=17,<18",  # faster-whisper 1.2 passes an option that av 19 removed
   "faster-whisper>=1.2,<2",
   "numpy>=2,<3",
   "platformdirs>=4.3,<5",
