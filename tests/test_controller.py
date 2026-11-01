@@ -344,3 +344,18 @@ def test_default_folders_come_from_the_system(monkeypatch, tmp_path):
     assert settings.transcribe_model == "large-v3"
     monkeypatch.setenv("COURSESCRIBE_HOME", str(tmp_path))
     assert app_home() == tmp_path
+
+
+def test_clicking_retry_twice_does_not_process_a_job_twice(rig):
+    rig.proofreader.blocked = "没有启动"
+    rig.controller.start()
+    rig.controller.add_files([rig.source()])
+    rig.wait_idle()
+    rig.proofreader.blocked = None
+    rig.proofreader.models.clear()
+    rig.controller.retry_waiting()
+    rig.controller.retry_waiting()
+    rig.wait_idle()
+    rig.wait(lambda: rig.controller.state.waiting_proofread == 0)
+    assert len(rig.proofreader.models) == 1
+    assert rig.controller.state.pending == 0

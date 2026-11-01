@@ -60,6 +60,7 @@ class AppController:
         self._now = now
         self._pipeline = Pipeline(store, transcriber, proofreader, repair_wav, on_status=self._on_job_status)
         self._queue: queue.Queue[Job | None] = queue.Queue()
+        self._queued_ids: set[str] = set()
         self._worker = threading.Thread(target=self._work, name="jobs", daemon=True)
         self._lock = threading.RLock()
         self._listeners: list[Callable[[AppState], None]] = []
@@ -92,6 +93,9 @@ class AppController:
 
     def _enqueue(self, job: Job) -> None:
         with self._lock:
+            if job.job_id in self._queued_ids:
+                return
+            self._queued_ids.add(job.job_id)
             pending = self.state.pending + 1
         self._publish(pending=pending)
         self._queue.put(job)
@@ -127,6 +131,7 @@ class AppController:
 
     def _finish_job(self, job: Job) -> None:
         with self._lock:
+            self._queued_ids.discard(job.job_id)
             pending = self.state.pending - 1
             notice = self.state.notice
         changes: dict = {"pending": pending}

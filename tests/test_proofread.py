@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import socket
+import time
+from pathlib import Path
 
 import pytest
 
@@ -99,6 +102,29 @@ class TestIsLossless:
 
     def test_formatting_already_in_the_source_is_fine(self):
         assert is_lossless("用 `git` 命令", "用 `git` 命令。")
+
+    def test_repeated_teaching_passages_are_compared_in_place(self):
+        passage = "索引就像一本书的目录可以帮助我们快速找到内容如果没有索引就只能一条一条的查找"
+        original = passage * 8
+        corrected = passage.replace("一条的", "一条地") + passage * 7
+        assert is_lossless(original, corrected)
+        assert is_lossless(original, "，".join([passage] * 8))
+
+    def test_a_lost_passage_among_repeats_is_still_caught(self):
+        passage = "索引就像一本书的目录"
+        assert not is_lossless(passage * 8, passage * 7)
+        assert not is_lossless(passage * 8, passage * 9)
+
+    def test_very_different_lengths_are_rejected_quickly(self):
+        started = time.perf_counter()
+        assert not is_lossless("甲" * 5000, "甲" * 100)
+        assert not is_lossless("甲乙" * 2000, "丙丁" * 2000)
+        assert time.perf_counter() - started < 1.0
+
+    def test_real_reply_on_a_repeating_lecture_is_not_mistaken_for_lost_text(self):
+        """Self-written lesson text and a real model reply that an earlier comparison rejected."""
+        sample = json.loads((Path(__file__).parent / "fixtures" / "repeating_lecture.json").read_text(encoding="utf-8"))
+        assert is_lossless(sample["original"], sample["corrected"])
 
     def test_nothing_to_check(self):
         assert is_lossless("", "")

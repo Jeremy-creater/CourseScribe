@@ -8,7 +8,6 @@ touches the body text while paragraphing.
 
 from __future__ import annotations
 
-import difflib
 import hashlib
 import logging
 import re
@@ -42,6 +41,8 @@ _MAX_REPLACED = 6
 _MAX_TERM_LENGTH = 12
 _MAX_CHANGED_RATIO = 0.05
 _MIN_CHANGES_ALLOWED = 3
+_MIN_SEARCH_WIDTH = 40
+_SEARCH_WIDTH_RATIO = 0.1
 _FORMATTING = ("#", "*", "`", ">", "- ")
 
 _PROMPT = (
@@ -70,13 +71,13 @@ def is_lossless(original: str, corrected: str) -> bool:
         return False
     before = content_chars(original)
     after = content_chars(corrected)
+    limit = max(_MIN_CHANGES_ALLOWED, len(before) * _MAX_CHANGED_RATIO)
+    differences = _differences(before, after, max(_MIN_SEARCH_WIDTH, int(len(before) * _SEARCH_WIDTH_RATIO)))
+    if differences is None:
+        return False
     changed = 0
-    matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
-    for operation, i1, i2, j1, j2 in matcher.get_opcodes():
-        if operation == "equal":
-            continue
-        old, new = before[i1:i2], after[j1:j2]
-        if operation == "replace":
+    for old, new in differences:
+        if old and new:
             if (old.isascii() or new.isascii()) and max(len(old), len(new)) <= _MAX_TERM_LENGTH:
                 changed += 1
             elif len(old) <= _MAX_REPLACED and abs(len(old) - len(new)) <= 1:
@@ -88,7 +89,67 @@ def is_lossless(original: str, corrected: str) -> bool:
             if len(real) > _MAX_LOST_RUN:
                 return False
             changed += len(real)
-    return changed <= max(_MIN_CHANGES_ALLOWED, len(before) * _MAX_CHANGED_RATIO)
+    return changed <= limit
+
+
+def _differences(before: str, after: str, width: int) -> list[tuple[str, str]] | None:
+    """The smallest set of (old, new) edits, or None if it needs more than ``width``.
+
+    A true edit-distance alignment: a quicker matcher pairs up the wrong copy when
+    a teacher repeats a passage, and then reports intact text as lost. Only cells
+    near the diagonal are computed, which keeps this fast and bounds the work.
+    """
+    if abs(len(before) - len(after)) > width:
+        return None
+    outside = width + 1
+    # moves[i][j - low(i)]: 0 match, 1 substitute, 2 delete from before, 3 insert from after
+    moves: list[list[int]] = []
+    row = {j: j for j in range(0, min(width, len(after)) + 1)}
+    for i, old_char in enumerate(before, start=1):
+        low, high = max(0, i - width), min(len(after), i + width)
+        current: dict[int, int] = {}
+        chosen = []
+        for j in range(low, high + 1):
+            options = [(row.get(j, outside) + 1, 2), (current.get(j - 1, outside) + 1, 3)]
+            if j > 0:
+                same = old_char == after[j - 1]
+                options.insert(0, (row.get(j - 1, outside) + (0 if same else 1), 0 if same else 1))
+            else:
+                options[0] = (i, 2)
+            best, move = min(options, key=lambda option: option[0])
+            current[j] = best
+            chosen.append(move)
+        if min(current.values(), default=outside) > width:
+            return None
+        moves.append(chosen)
+        row = current
+    if not before:
+        return [("", after)] if after else []
+    if row.get(len(after), outside) > width:
+        return None
+
+    edits: list[tuple[str, str]] = []
+    old_run: list[str] = []
+    new_run: list[str] = []
+    i, j = len(before), len(after)
+    while i > 0 or j > 0:
+        move = 3 if i == 0 else moves[i - 1][j - max(0, i - width)]
+        if move == 0:
+            if old_run or new_run:
+                edits.append(("".join(reversed(old_run)), "".join(reversed(new_run))))
+                old_run, new_run = [], []
+            i, j = i - 1, j - 1
+            continue
+        if move in (1, 2):
+            old_run.append(before[i - 1])
+            i -= 1
+        if move in (1, 3):
+            new_run.append(after[j - 1])
+            j -= 1
+    if old_run or new_run:
+        edits.append(("".join(reversed(old_run)), "".join(reversed(new_run))))
+    edits.reverse()
+    return edits
 
 
 _NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)*")
