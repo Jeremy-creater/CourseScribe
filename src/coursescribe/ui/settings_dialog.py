@@ -31,6 +31,7 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置")
+        self.setMinimumWidth(620)
         self._folder = current.output_dir
         self._choose_folder = choose_folder or self._pick_folder
 
