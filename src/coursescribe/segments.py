@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -46,5 +47,19 @@ def read_segments(path: Path) -> list[Segment]:
     return segments
 
 
+def _has_content(text: str) -> bool:
+    return any(not unicodedata.category(ch).startswith("P") for ch in text)
+
+
 def segments_to_text(segments: list[Segment]) -> str:
-    return "".join(f"{segment.text}\n" for segment in segments)
+    """One line per spoken segment; punctuation alone joins the line before it."""
+    lines: list[str] = []
+    for segment in segments:
+        text = " ".join(segment.text.split())
+        if not text:
+            continue
+        if _has_content(text):
+            lines.append(text)
+        elif lines:
+            lines[-1] += text
+    return "".join(f"{line}\n" for line in lines)
