@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store
+.idea/
+.vscode/
+.venv/
+
+# build and test artifacts
+build/
+dist/
+.pytest_cache/
+.hypothesis/
+.coverage
+coverage*.json
+
+# private recordings and transcripts must never enter the repository
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.mkv
+
+# Claude Code and tdd-guardian files live in a separate private repository
+/.claude/

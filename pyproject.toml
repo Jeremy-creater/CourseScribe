@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coursescribe"
+version = "0.1.0"
+description = "Record a course or pick a media file, and get a full proofread transcript. Runs locally."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "pytest-cov>=5"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--strict-markers"
+markers = [
+  "engine: real in-process transcription model, no external services",
+  "integration: real running Ollama service",
+  "gui: real desktop (audio capture, hotkeys, permissions, drag and drop)",
+  "perf: timing measurements, not part of any gate",
+]
