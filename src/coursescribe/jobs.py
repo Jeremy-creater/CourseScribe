@@ -61,6 +61,7 @@ class Job:
     message: str = ""
     unproofread_chunks: int = 0
     total_chunks: int = 0
+    model_download_requested: bool = False
 
     @classmethod
     def new_recording(cls, root: Path, now: datetime, transcribe_model: str, proofread_model: str) -> Job:

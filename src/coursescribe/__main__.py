@@ -12,7 +12,9 @@ def main(argv: list[str] | None = None) -> int:
     if "--version" in args:
         print(f"CourseScribe {__version__}")
         return 0
-    return 0
+    from coursescribe.ui.app import run
+
+    return run()
 
 
 if __name__ == "__main__":

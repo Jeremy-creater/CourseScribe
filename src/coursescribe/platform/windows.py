@@ -6,6 +6,8 @@ import ctypes
 import os
 import sys
 import threading
+from collections.abc import Callable
+from ctypes import wintypes
 from pathlib import Path
 
 import numpy as np
@@ -84,3 +86,53 @@ def prepare_gpu_libraries() -> None:
     folders = [str(folder) for root in roots if root.is_dir() for folder in root.glob("*/bin")]
     if folders:
         os.environ["PATH"] = os.pathsep.join([*folders, os.environ.get("PATH", "")])
+
+
+HOTKEY_LABEL = "Ctrl+Alt+R"
+_MOD_ALT = 0x0001
+_MOD_CONTROL = 0x0002
+_MOD_NOREPEAT = 0x4000
+_VK_R = 0x52
+_WM_HOTKEY = 0x0312
+_WM_QUIT = 0x0012
+_HOTKEY_ID = 1
+
+
+class GlobalHotkey:
+    """Calls back when the shortcut is pressed, whichever program has the focus."""
+
+    def __init__(self, callback: Callable[[], None]) -> None:
+        self._callback = callback
+        self._thread = threading.Thread(target=self._listen, name="hotkey", daemon=True)
+        self._ready = threading.Event()
+        self._registered = False
+        self._thread_id = 0
+
+    def start(self) -> bool:
+        """Returns False when another program already owns this shortcut."""
+        self._thread.start()
+        self._ready.wait(5)
+        return self._registered
+
+    def _listen(self) -> None:
+        user32 = ctypes.windll.user32
+        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+        modifiers = _MOD_CONTROL | _MOD_ALT | _MOD_NOREPEAT
+        self._registered = bool(user32.RegisterHotKey(None, _HOTKEY_ID, modifiers, _VK_R))
+        self._ready.set()
+        if not self._registered:
+            return
+        message = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+            if message.message == _WM_HOTKEY:
+                self._callback()
+        user32.UnregisterHotKey(None, _HOTKEY_ID)
+
+    def stop(self) -> None:
+        if self._registered and self._thread.is_alive():
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, _WM_QUIT, 0, 0)
+            self._thread.join(2.0)
+
+
+def create_global_hotkey(callback: Callable[[], None]) -> GlobalHotkey:
+    return GlobalHotkey(callback)

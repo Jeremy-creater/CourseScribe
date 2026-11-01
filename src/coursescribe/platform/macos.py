@@ -9,3 +9,18 @@ def open_system_audio():
 
 def prepare_gpu_libraries() -> None:
     """Nothing to prepare: the Mac build runs the engine on the CPU."""
+
+
+HOTKEY_LABEL = ""
+
+
+class _NoHotkey:
+    def start(self) -> bool:
+        return False
+
+    def stop(self) -> None:
+        pass
+
+
+def create_global_hotkey(callback) -> _NoHotkey:
+    return _NoHotkey()

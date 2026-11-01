@@ -75,3 +75,39 @@ def test_recording_survives_the_process_being_killed(tmp_path):
 
     with av.open(str(target)) as media:
         assert sum(frame.samples for frame in media.decode(audio=0)) == pytest.approx(seconds * 48000, rel=0.01)
+
+
+def _press_hotkey() -> None:
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    ctrl, alt, r, key_up = 0x11, 0x12, 0x52, 0x0002
+    for key in (ctrl, alt, r):
+        user32.keybd_event(key, 0, 0, 0)
+    for key in (r, alt, ctrl):
+        user32.keybd_event(key, 0, key_up, 0)
+
+
+def test_global_hotkey_fires_while_another_program_has_focus():
+    from coursescribe.platform import create_global_hotkey
+
+    pressed = threading.Event()
+    hotkey = create_global_hotkey(pressed.set)
+    assert hotkey.start(), "Ctrl+Alt+R is taken by another program"
+    try:
+        _press_hotkey()
+        assert pressed.wait(3)
+    finally:
+        hotkey.stop()
+
+
+def test_second_registration_reports_the_shortcut_is_taken():
+    from coursescribe.platform import create_global_hotkey
+
+    first = create_global_hotkey(lambda: None)
+    assert first.start()
+    try:
+        second = create_global_hotkey(lambda: None)
+        assert second.start() is False
+    finally:
+        first.stop()

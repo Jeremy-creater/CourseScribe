@@ -1,0 +1,275 @@
+"""The window, run off-screen with real widgets and the real application logic."""
+
+from __future__ import annotations
+
+import os
+import time
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+import shiboken6
+from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
+from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtWidgets import QApplication
+
+from coursescribe.settings import Settings
+from coursescribe.ui.main_window import MainWindow
+from coursescribe.ui.settings_dialog import SettingsDialog
+from test_controller import Rig
+
+
+@pytest.fixture(scope="module")
+def qt_app():
+    app = QApplication.instance() or QApplication([])
+    app.setStyle("Fusion")
+    yield app
+
+
+class Screen:
+    def __init__(self, tmp_path, qt_app):
+        self.qt_app = qt_app
+        self.rig = Rig(tmp_path)
+        self.chosen: list = []
+        self.answer_yes = True
+        self.asked: list[str] = []
+        self.window = MainWindow(
+            self.rig.controller,
+            hotkey_label="Ctrl+Alt+R",
+            choose_files=lambda: self.chosen,
+            confirm=self._confirm,
+            open_folder=self._open,
+            list_proofread_models=lambda: ["model-a", "model-b"],
+        )
+        self.opened: list = []
+        self.window.show()
+
+    def _confirm(self, text: str) -> bool:
+        self.asked.append(text)
+        return self.answer_yes
+
+    def _open(self, folder):
+        self.opened.append(folder)
+
+    def wait(self, condition, seconds=10.0):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            self.qt_app.processEvents()
+            if condition():
+                return
+            time.sleep(0.005)
+        raise AssertionError(f"Timed out; state: {self.rig.controller.state}")
+
+    def idle(self):
+        self.wait(lambda: self.rig.controller.state.pending == 0 and self.window.status_label.text() == "准备好了")
+
+    def close(self):
+        """Destroy the window here: Qt aborts if garbage collection does it on a worker thread."""
+        self.window.close()
+        self.rig.controller._listeners.clear()
+        self.qt_app.processEvents()
+        shiboken6.delete(self.window)
+        self.qt_app.processEvents()
+
+
+@pytest.fixture
+def screen(tmp_path, qt_app):
+    made = Screen(tmp_path, qt_app)
+    made.rig.controller.start()
+    yield made
+    made.close()
+
+
+def test_first_view_has_only_the_main_controls(screen):
+    window = screen.window
+    assert window.record_button.text() == "开始录音"
+    assert window.files_button.isVisible()
+    assert window.status_label.text() == "准备好了"
+    assert "Ctrl+Alt+R" in window.hotkey_label.text()
+    for hidden in (window.retry_button, window.download_button, window.open_button, window.progress_bar, window.silence_label):
+        assert not hidden.isVisible()
+
+
+def test_record_button_starts_and_stops_and_files_appear(screen):
+    screen.window.record_button.click()
+    screen.wait(lambda: screen.window.record_button.text() == "停止录音")
+    screen.wait(lambda: screen.rig.controller.recording_seconds() >= 0.5)
+    screen.window._refresh_recording_time()
+    assert screen.window.recording_label.text().startswith("正在录音")
+    screen.window.record_button.click()
+    screen.wait(lambda: screen.window.record_button.text() == "开始录音")
+    screen.idle()
+    job = screen.rig.store.load_all()[0]
+    assert job.md_path.exists() and job.txt_path.exists() and job.audio_path.exists()
+    assert screen.window.open_button.isVisible()
+    assert "完成" in screen.window.notice_label.text()
+
+
+def test_hotkey_signal_toggles_recording(screen):
+    screen.window.hotkey_pressed.emit()
+    screen.wait(lambda: screen.rig.controller.state.recording)
+    screen.window.hotkey_pressed.emit()
+    screen.wait(lambda: not screen.rig.controller.state.recording)
+    screen.idle()
+
+
+def test_choose_files_button_queues_the_chosen_files(screen):
+    screen.chosen = [screen.rig.source("a.mp3"), screen.rig.source("b.mkv")]
+    screen.window.files_button.click()
+    screen.idle()
+    assert [job.txt_path.stem for job in screen.rig.store.load_all()] == ["a", "b"]
+
+
+def test_cancelling_the_file_picker_does_nothing(screen):
+    screen.chosen = []
+    screen.window.files_button.click()
+    assert screen.rig.store.load_all() == []
+
+
+def _mime(paths):
+    data = QMimeData()
+    data.setUrls([QUrl.fromLocalFile(str(path)) for path in paths])
+    return data
+
+
+def test_dragging_files_onto_the_window_starts_them(screen):
+    source = screen.rig.source("拖进来.mp4")
+    data = _mime([source])
+    enter = QDragEnterEvent(screen.window.rect().center(), Qt.CopyAction, data, Qt.LeftButton, Qt.NoModifier)
+    QApplication.sendEvent(screen.window, enter)
+    assert enter.isAccepted()
+    drop = QDropEvent(QPointF(screen.window.rect().center()), Qt.CopyAction, data, Qt.LeftButton, Qt.NoModifier)
+    QApplication.sendEvent(screen.window, drop)
+    screen.idle()
+    assert screen.rig.store.load_all()[0].md_path.name == "拖进来.md"
+
+
+def test_dragging_something_without_files_is_refused(screen):
+    data = QMimeData()
+    data.setText("just text")
+    enter = QDragEnterEvent(screen.window.rect().center(), Qt.CopyAction, data, Qt.LeftButton, Qt.NoModifier)
+    QApplication.sendEvent(screen.window, enter)
+    assert not enter.isAccepted()
+
+
+def test_progress_bar_follows_progress(screen):
+    from coursescribe.controller import AppState
+
+    screen.window._show_state(AppState(status="正在校对（第 3/20 段）", fraction=0.15, pending=1))
+    assert screen.window.status_label.text() == "正在校对（第 3/20 段）"
+    assert screen.window.progress_bar.isVisible()
+    assert screen.window.progress_bar.value() == 150
+    screen.window._show_state(AppState(status="正在准备转录", fraction=None, pending=1))
+    assert screen.window.progress_bar.maximum() == 0  # moving bar: length unknown
+
+
+def test_blocked_proofreading_shows_the_way_out_and_the_button_finishes_it(screen):
+    screen.rig.proofreader.blocked = "校对服务（Ollama）没有启动。"
+    screen.rig.controller.add_files([screen.rig.source()])
+    screen.idle()
+    assert "Ollama" in screen.window.notice_label.text()
+    assert screen.window.retry_button.isVisible()
+    screen.rig.proofreader.blocked = None
+    screen.window.retry_button.click()
+    screen.wait(lambda: not screen.window.retry_button.isVisible())
+    screen.idle()
+    assert screen.rig.store.load_all()[0].md_path.exists()
+
+
+def test_download_states_the_size_and_respects_no(screen):
+    screen.rig.transcriber.missing.add("large-v3")
+    screen.rig.controller.add_files([screen.rig.source()])
+    screen.idle()
+    assert screen.window.download_button.isVisible()
+    assert "3.1 GB" in screen.window.download_button.text()
+
+    screen.answer_yes = False
+    screen.window.download_button.click()
+    assert "3.1 GB" in screen.asked[0]
+    assert screen.rig.downloads == []
+
+    screen.answer_yes = True
+    screen.window.download_button.click()
+    screen.wait(lambda: screen.rig.downloads == ["large-v3"])
+    screen.wait(lambda: not screen.window.download_button.isVisible())
+
+
+def test_silence_warning_is_shown_and_cleared(screen):
+    screen.rig.controller._on_silence(True)
+    screen.wait(lambda: screen.window.silence_label.isVisible())
+    assert "没有录到声音" in screen.window.silence_label.text()
+    screen.rig.controller._on_silence(False)
+    screen.wait(lambda: not screen.window.silence_label.isVisible())
+
+
+def test_open_folder_button_opens_the_last_result(screen):
+    screen.rig.controller.add_files([screen.rig.source("课.mp3")])
+    screen.idle()
+    screen.window.open_button.click()
+    assert screen.opened == [screen.rig.tmp_path / "out" / "课"]
+
+
+def test_closing_the_window_saves_a_running_recording(tmp_path, qt_app):
+    made = Screen(tmp_path, qt_app)
+    made.rig.controller.start()
+    made.window.record_button.click()
+    made.wait(lambda: made.rig.controller.recording_seconds() >= 0.25)
+    made.close()
+    job = made.rig.store.load_all()[0]
+    assert job.stage.value == "transcribing"
+
+
+class TestSettingsDialog:
+    def _dialog(self, tmp_path, qt_app):
+        current = Settings(tmp_path / "out", "large-v3", "model-a")
+        return SettingsDialog(current, ["model-a", "model-b"], choose_folder=lambda: tmp_path / "new")
+
+    def test_shows_current_values(self, tmp_path, qt_app):
+        dialog = self._dialog(tmp_path, qt_app)
+        assert dialog.transcribe_box.currentText() == "large-v3"
+        assert dialog.proofread_box.currentText() == "model-a"
+        assert dialog.folder_label.text() == str(tmp_path / "out")
+
+    def test_returns_the_changed_values(self, tmp_path, qt_app):
+        dialog = self._dialog(tmp_path, qt_app)
+        dialog.transcribe_box.setCurrentText("medium")
+        dialog.proofread_box.setCurrentText("model-b")
+        dialog.folder_button.click()
+        assert dialog.result_settings() == Settings(tmp_path / "new", "medium", "model-b")
+
+    def test_a_current_model_not_in_the_list_still_shows(self, tmp_path, qt_app):
+        current = Settings(tmp_path, "large-v3", "my-own-model")
+        dialog = SettingsDialog(current, [], choose_folder=lambda: None)
+        assert dialog.proofread_box.currentText() == "my-own-model"
+        dialog.folder_button.click()
+        assert dialog.result_settings().output_dir == tmp_path
+
+    def test_each_transcribe_model_shows_its_size(self, tmp_path, qt_app):
+        dialog = self._dialog(tmp_path, qt_app)
+        assert dialog.transcribe_box.itemData(0) is not None
+        labels = [dialog.transcribe_box.itemText(i) for i in range(dialog.transcribe_box.count())]
+        assert "large-v3" in labels
+        assert "GB" in dialog.size_label.text()
+
+
+def test_settings_button_saves_through_the_dialog(screen, tmp_path, monkeypatch):
+    from coursescribe.ui import main_window
+
+    class Stub:
+        def __init__(self, current, models, parent=None):
+            assert models == ["model-a", "model-b"]
+            self.current = current
+
+        def exec(self):
+            return 1
+
+        def result_settings(self):
+            return Settings(tmp_path / "picked", "medium", "model-b")
+
+        def deleteLater(self):
+            pass
+
+    monkeypatch.setattr(main_window, "SettingsDialog", Stub)
+    screen.window.settings_button.click()
+    assert screen.rig.controller.settings.transcribe_model == "medium"
+    assert screen.rig.settings.load().output_dir == tmp_path / "picked"
