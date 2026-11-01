@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -31,6 +32,18 @@ class Stage(str, Enum):
 
 
 FINISHED_STAGES = frozenset({Stage.DONE, Stage.FAILED})
+
+
+_last_stamp = 0
+_stamp_lock = threading.Lock()
+
+
+def _next_creation_stamp() -> int:
+    """Strictly increasing, because the system clock can repeat between two calls."""
+    global _last_stamp
+    with _stamp_lock:
+        _last_stamp = max(_last_stamp + 1, time.time_ns())
+        return _last_stamp
 
 
 @dataclass
@@ -83,7 +96,7 @@ class Job:
             md_path=folder / f"{name}.md",
             transcribe_model=transcribe_model,
             proofread_model=proofread_model,
-            created_ns=time.time_ns(),
+            created_ns=_next_creation_stamp(),
         )
 
     def to_dict(self) -> dict:
