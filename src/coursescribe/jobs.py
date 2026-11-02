@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -33,6 +34,52 @@ class Stage(str, Enum):
 
 FINISHED_STAGES = frozenset({Stage.DONE, Stage.FAILED})
 _CLOSED_CLEANLY = "closed-cleanly"
+
+NAME_LIMIT = 80
+PATH_LIMIT = 259  # Windows MAX_PATH, less the terminating null
+MIN_NAME = 20
+FALLBACK_NAME = "未命名"
+# Longest path a job makes: root\name (99)\name (99).txt = root + 2 * name + 16
+_NAME_BUDGET = PATH_LIMIT - 16
+_EXTENDERS = frozenset("\u200d\ufe0e\ufe0f")
+
+
+class SaveFolderTooLong(Exception):
+    """The save folder leaves too little room in a path for any job name. Not an OSError on purpose."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(f"Save folder path is too long for job names: {root}")
+        self.root = root
+
+
+def _units(text: str) -> int:
+    """Length as Windows counts it, in UTF-16 units."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def _extends(char: str) -> bool:
+    """Whether ``char`` belongs to the character before it: marks, joiners, variation and skin tone."""
+    return unicodedata.combining(char) > 0 or char in _EXTENDERS or "\U0001f3fb" <= char <= "\U0001f3ff"
+
+
+def job_name(raw: str, root: Path) -> str:
+    """The name for a job's folder and files: ``raw`` cut so every path the job makes fits."""
+    limit = min(NAME_LIMIT, (_NAME_BUDGET - _units(str(root))) // 2)
+    if limit < MIN_NAME:
+        raise SaveFolderTooLong(root)
+    name = raw
+    if _units(raw) > limit:
+        end = units = 0
+        for char in raw:
+            units += _units(char)
+            if units > limit:
+                break
+            end += 1
+        # never split a character from its marks; a space or dot cut off here could expose a joiner
+        while end and (_extends(raw[end]) or raw[end - 1] in "\u200d ."):
+            end -= 1
+        name = raw[:end]
+    return name.rstrip(" .") or FALLBACK_NAME  # Windows drops these from the end of a name
 
 
 _last_stamp = 0
@@ -69,14 +116,14 @@ class Job:
 
     @classmethod
     def new_recording(cls, root: Path, now: datetime, transcribe_model: str, proofread_model: str) -> Job:
-        name = f"{now:%Y-%m-%d %H-%M} 录音"
+        name = job_name(f"{now:%Y-%m-%d %H-%M} 录音", root)
         folder = unique_dir(root / name)
         return cls._create(JobKind.RECORDING, Stage.RECORDING, folder, name, folder / f"{name}.wav", transcribe_model, proofread_model)
 
     @classmethod
     def new_file(cls, source: Path, root: Path, now: datetime, transcribe_model: str, proofread_model: str) -> Job:
         del now  # file jobs are named after the source, not the time
-        name = source.stem
+        name = job_name(source.stem, root)
         folder = unique_dir(root / name)
         return cls._create(JobKind.FILE, Stage.TRANSCRIBING, folder, name, source, transcribe_model, proofread_model)
 

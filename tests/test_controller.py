@@ -1208,3 +1208,83 @@ def test_mac_keep_awake_can_be_used_and_never_fails():
 def test_unexpected_error_is_reported_in_plain_words(rig):
     rig.controller.report_unexpected_error()
     assert "日志" in rig.controller.state.notice
+
+
+# --- long names (docs/plans/M2-long-names-tests.md) ---
+
+
+def _u16(text):
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def _fits(root):
+    """How many characters a long name keeps in ``root``: 80, less when the save folder path is long (N7)."""
+    return min(80, (243 - _u16(str(root))) // 2)
+
+
+def test_long_file_name_goes_all_the_way_under_a_recognisable_name(rig):
+    name = "讲" * _fits(rig.tmp_path / "out")
+    source = rig.source("讲" * 100 + ".mp3")
+    rig.controller.start()
+    rig.controller.add_files([source])
+    rig.wait_idle()
+    folder = rig.tmp_path / "out" / name
+    assert rig.controller.state.notice == "完成：" + name
+    assert rig.controller.state.last_folder.name == name
+    assert "讲" * 100 + "的内容" in (folder / f"{name}.txt").read_text(encoding="utf-8")  # read from the full path
+    assert (folder / f"{name}.md").read_text(encoding="utf-8").splitlines()[0] == "# " + name
+    assert sorted(p.name for p in folder.iterdir()) == sorted([f"{name}.txt", f"{name}.md"])
+    assert source.read_bytes() == b"audio"
+
+
+def _too_long_output(rig):
+    root = rig.tmp_path / ("r" * (204 - _u16(str(rig.tmp_path / "r")) + 1))
+    assert _u16(str(root)) == 204
+    current = rig.controller.settings
+    rig.controller.update_settings(Settings(root, current.transcribe_model, current.proofread_model))
+    return root
+
+
+@pytest.mark.parametrize("action", ["add_files", "record"])
+def test_save_folder_path_too_long_says_why_and_leaves_nothing(rig, action):
+    root = _too_long_output(rig)
+    rig.controller.start()
+    if action == "add_files":
+        rig.controller.add_files([rig.source("a.mp3"), rig.source("b.mp3")])
+    else:
+        rig.controller.toggle_recording()
+    notice = rig.controller.state.notice
+    reason = f"保存文件夹的路径太长：{root}。请在设置里换一个路径短一些的文件夹。"
+    assert "打不开" not in notice  # not blamed on an unplugged drive
+    if action == "add_files":
+        assert notice == "没有加入：a.mp3、b.mp3。" + reason
+    else:
+        assert notice == "没有开始录音。" + reason
+    if action == "record":
+        assert rig.controller.state.recording is False
+    assert rig.controller.state.pending == 0
+    assert rig.store.load_all() == []
+    assert not root.exists()
+    assert {p.name for p in rig.tmp_path.iterdir()} <= {"input", "settings.json", "state"}
+    assert rig.awake.history == []
+
+
+def test_cut_name_is_kept_when_the_job_resumes_after_a_restart(tmp_path, monkeypatch):
+    from coursescribe import jobs
+
+    name = "讲" * _fits(tmp_path / "out")
+    first = Rig(tmp_path)  # never started and never shut down: closed before transcribing, like a crash
+    first.controller.add_files([first.source("讲" * 100 + ".mp3")])
+    saved = first.store.load_all()[0]
+    assert saved.stage is Stage.TRANSCRIBING
+    monkeypatch.setattr(jobs, "NAME_LIMIT", 40)
+    assert len(jobs.job_name("讲" * 100, tmp_path / "out")) == 40  # a fresh name would now differ
+    second = Rig(tmp_path)
+    second.controller.start()
+    second.wait_idle()
+    out = tmp_path / "out"
+    assert second.controller.state.notice == "完成：" + name
+    assert sorted(p.name for p in out.iterdir()) == [name]
+    assert sorted(p.name for p in (out / name).iterdir()) == sorted([f"{name}.txt", f"{name}.md"])
+    assert second.store.load_all()[0].folder == saved.folder
+    second.check_keep_awake_follows_busy()

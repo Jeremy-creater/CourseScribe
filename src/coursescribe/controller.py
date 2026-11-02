@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
-from coursescribe.jobs import Job, JobStore, Stage
+from coursescribe.jobs import Job, JobStore, SaveFolderTooLong, Stage
 from coursescribe.models import model_size_label
 from coursescribe.pipeline import Pipeline, Proofreader, Transcriber
 from coursescribe.recorder import AudioCapture, RecordingFailed, RecordingSession
@@ -33,6 +33,8 @@ def _remove_if_empty(folder: Path) -> None:
     except OSError:
         pass  # gone already, or not ours to clean up
 
+
+SAVE_FOLDER_TOO_LONG = "保存文件夹的路径太长：{root}。请在设置里换一个路径短一些的文件夹。"
 
 SLEEP_WARNING = "没能阻止电脑自动睡眠，录音或处理中途电脑可能会睡着。需要的话，请在系统设置里暂时关掉自动睡眠。"
 
@@ -278,6 +280,7 @@ class AppController:
         """Queue media files. Anything else is refused, and the notice says why."""
         refused: list[str] = []
         no_folder: list[str] = []
+        too_long: list[str] = []
         no_record: list[str] = []
         settings = self.settings
         for path in paths:
@@ -290,6 +293,9 @@ class AppController:
                 continue
             try:
                 job = Job.new_file(path, settings.output_dir, self._now(), settings.transcribe_model, settings.proofread_model)
+            except SaveFolderTooLong:
+                too_long.append(path.name)
+                continue
             except OSError as exc:
                 logger.warning("Could not create a job folder: %s", exc)
                 no_folder.append(path.name)
@@ -299,6 +305,8 @@ class AppController:
             else:
                 no_record.append(path.name)
         notices = []
+        if too_long:
+            notices.append("没有加入：" + "、".join(too_long) + "。" + SAVE_FOLDER_TOO_LONG.format(root=settings.output_dir))
         if no_folder:
             notices.append("没有加入：" + "、".join(no_folder) + "。" + self._folder_problem())
         if no_record:
@@ -337,6 +345,9 @@ class AppController:
         settings = self.settings
         try:
             job = Job.new_recording(settings.output_dir, self._now(), settings.transcribe_model, settings.proofread_model)
+        except SaveFolderTooLong:
+            self._publish(notice="没有开始录音。" + SAVE_FOLDER_TOO_LONG.format(root=settings.output_dir))
+            return
         except OSError as exc:
             logger.warning("Could not create a recording folder: %s", exc)
             self._publish(notice="没有开始录音。" + self._folder_problem())
