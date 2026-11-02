@@ -11,16 +11,20 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import time
 import unicodedata
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from typing import TypeVar
 
 from coursescribe.files import atomic_write_json, read_json
 from coursescribe.ollama import (
+    OllamaBusy,
     OllamaClient,
     OllamaDown,
     OllamaError,
     OllamaModelMissing,
+    OllamaTimeout,
 )
 from coursescribe.pipeline import ProofreadBlocked, ProofreadResult
 from coursescribe.text import chunk_text, clean_fillers, clean_tics, content_chars, correct_terms, split_sentences
@@ -50,6 +54,10 @@ _MIN_CHANGES_ALLOWED = 3
 _MIN_SEARCH_WIDTH = 40
 _SEARCH_WIDTH_RATIO = 0.1
 _FORMATTING = ("#", "*", "`", ">", "- ")
+# Errors of the service rather than of this piece of text: proofreading waits instead.
+_NOT_THIS_CHUNK = (OllamaDown, OllamaModelMissing, OllamaTimeout, OllamaBusy)
+
+T = TypeVar("T")
 
 _PROMPT = (
     "你是中文讲课转录稿的编辑。把下面的口语转录整理成可直接阅读的文字稿，要求：\n"
@@ -62,6 +70,15 @@ _PROMPT = (
     "不要加标题、列表或任何格式。直接返回处理后的正文，不要任何说明或前缀。"
 )
 _TERMS_NOTE = "\n本课的常用词：{terms}。转录里读音相同或相近的错字，改成这些词。"
+TIMEOUT_MESSAGE = (
+    "校对服务（Ollama）太久没有回应，可能正忙，或显卡内存（显存）不够跑得很慢。文字稿已保存，已校对好的段落也会保留。"
+    "请稍后点“继续校对”，会从没做完的段落接着做；一直这样的话，请关掉其他占用显卡的程序，或在设置里换一个小一点的模型。"
+)
+BUSY_MESSAGE = (
+    "校对服务（Ollama）暂时出错了，可能是显卡内存（显存）不够或服务不稳定。文字稿已保存，已校对好的段落也会保留。"
+    "请稍后点“继续校对”，会从没做完的段落接着做；一直这样的话，请重启 Ollama"
+    "（在屏幕右下角的托盘图标里退出 Ollama 再打开），或在设置里换一个小一点的模型。"
+)
 _RETRY_NOTE = "\n注意：上一次的结果漏掉或改动了原文内容。这一次除口头禅外必须一字不漏。"
 _BREAK_PROMPT = (
     "下面是一段讲课转录稿，已经按句子编号，每行一句。请根据话题转换，判断应该在哪些句子之后分段。"
@@ -269,8 +286,10 @@ class OllamaProofreader:
         client: OllamaClient | None = None,
         chunk_chars: int = _CHUNK_CHARS,
         vocabulary: Callable[[], Vocabulary] = lambda: EMPTY,
+        retry_pause: float = 3.0,
     ) -> None:
         self.client = client or OllamaClient()
+        self.retry_pause = retry_pause
         self.chunk_chars = chunk_chars
         self._load_vocabulary = vocabulary
         self._vocabulary = EMPTY
@@ -294,9 +313,27 @@ class OllamaProofreader:
             ) from exc
         except OllamaModelMissing as exc:
             raise ProofreadBlocked(_missing_model_message(model)) from exc
+        except OllamaTimeout as exc:
+            logger.info("Ollama did not answer in time: %s", exc)
+            raise ProofreadBlocked(TIMEOUT_MESSAGE) from exc
+        except OllamaBusy as exc:
+            logger.info("Ollama failed for now: %s", exc)
+            raise ProofreadBlocked(BUSY_MESSAGE) from exc
+
+    def _ask(self, request: Callable[[], T]) -> T:
+        """Send ``request`` once more after a pause if the service failed for now.
+
+        A timeout is not sent again: it has already waited a long time.
+        """
+        try:
+            return request()
+        except OllamaBusy as exc:
+            logger.warning("Ollama failed for now, asking again: %s", exc)
+            time.sleep(self.retry_pause)
+            return request()
 
     def _check_ready(self, model: str) -> None:
-        if model not in self.client.models():
+        if model not in self._ask(self.client.models):
             raise OllamaModelMissing(model)
 
     def _run(self, text: str, model: str, checkpoint: Path, on_progress) -> ProofreadResult:
@@ -336,8 +373,8 @@ class OllamaProofreader:
         for attempt in range(_ATTEMPTS):
             prompt = self._prompt() + (_RETRY_NOTE if attempt else "") + TEXT_MARKER + chunk
             try:
-                reply = self.client.generate(model, prompt)
-            except (OllamaDown, OllamaModelMissing):
+                reply = self._ask(lambda: self.client.generate(model, prompt))
+            except _NOT_THIS_CHUNK:
                 raise
             except OllamaError as exc:
                 logger.warning("Proofreading attempt %d failed: %s", attempt + 1, exc)
@@ -383,8 +420,8 @@ class OllamaProofreader:
             return []
         numbered = "\n".join(f"{i}. {' '.join(s.split())}" for i, s in enumerate(window, start=1))
         try:
-            reply = self.client.generate(model, _BREAK_PROMPT + numbered)
-        except (OllamaDown, OllamaModelMissing):
+            reply = self._ask(lambda: self.client.generate(model, _BREAK_PROMPT + numbered))
+        except _NOT_THIS_CHUNK:
             raise
         except OllamaError as exc:
             logger.warning("Paragraph request failed, leaving this part unbroken: %s", exc)

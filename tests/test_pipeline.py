@@ -17,7 +17,11 @@ from coursescribe.pipeline import (
     ProofreadResult,
     Stopped,
 )
-from coursescribe.segments import Segment
+from coursescribe.ollama import OllamaClient
+from coursescribe.proofread import BREAK_MARKER, TEXT_MARKER, TIMEOUT_MESSAGE, OllamaProofreader
+from coursescribe.segments import Segment, segments_to_text
+from coursescribe.text import content_chars
+from fake_ollama import FakeOllama, Reply
 
 NOW = datetime(2026, 11, 1, 19, 30)
 SEGMENTS = [Segment(float(i), float(i + 1), f"第{i}句") for i in range(5)]
@@ -305,3 +309,55 @@ def test_checkpoints_are_removed_after_finishing(tmp_path):
     _pipeline(store).run(job)
     assert not store.segments_path(job).exists()
     assert not store.proofread_path(job).exists()
+
+
+THREE_PARTS = [Segment(float(i), float(i + 1), mark * 89) for i, mark in enumerate("甲乙丙")]
+
+
+def _three_part_model(slow_part: str | None = None):
+    """Gives back each chunk with a full stop; the chunk starting with ``slow_part`` answers too late."""
+
+    def respond(prompt):
+        if BREAK_MARKER in prompt:
+            return "无"
+        chunk = prompt.rsplit(TEXT_MARKER, 1)[1]
+        return Reply("晚了", delay=5.0) if chunk[0] == slow_part else chunk + "。"
+
+    return respond
+
+
+def _real_proofreader(fake: FakeOllama) -> OllamaProofreader:
+    client = OllamaClient(fake.url, timeout=0.5, unload_timeout=0.5)
+    return OllamaProofreader(client, chunk_chars=100, retry_pause=0)
+
+
+def test_slow_proofreading_service_waits_then_resumes_into_one_md(tmp_path):
+    store = JobStore(tmp_path / "state")
+    job = _job(tmp_path, store)
+    expected_txt = segments_to_text(THREE_PARTS).encode("utf-8")
+    slow = FakeOllama(_three_part_model(slow_part="乙"))
+    try:
+        _pipeline(store, FakeTranscriber(segments=list(THREE_PARTS)), _real_proofreader(slow)).run(job)
+    finally:
+        slow.close()
+    assert job.stage is Stage.WAITING_PROOFREAD
+    assert job.message == TIMEOUT_MESSAGE
+    saved = store.load_all()[0]
+    assert (saved.stage, saved.message) == (Stage.WAITING_PROOFREAD, TIMEOUT_MESSAGE)
+    assert list(job.folder.glob("*.md")) == []
+    assert job.txt_path.read_bytes() == expected_txt
+    assert store.proofread_path(job).exists()
+
+    fixed = FakeOllama(_three_part_model())
+    try:
+        _pipeline(store, FakeTranscriber(segments=list(THREE_PARTS)), _real_proofreader(fixed)).run(saved)
+    finally:
+        fixed.close()
+    final = store.load_all()[0]
+    assert final.stage is Stage.DONE
+    assert final.unproofread_chunks == 0
+    assert [p.name for p in final.folder.glob("*.md")] == ["课.md"]
+    markdown = final.md_path.read_text(encoding="utf-8")
+    assert markdown.startswith("# 课\n\n")
+    assert content_chars(markdown.removeprefix("# 课\n\n")) == content_chars(expected_txt.decode("utf-8"))
+    assert final.txt_path.read_bytes() == expected_txt
