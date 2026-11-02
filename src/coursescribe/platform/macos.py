@@ -12,6 +12,7 @@ def prepare_gpu_libraries() -> None:
 
 
 HOTKEY_LABEL = ""
+FILES_CAN_BE_HELD = False  # an open file never shuts others out; a refusal is real
 
 
 class _NoHotkey:

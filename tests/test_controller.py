@@ -289,6 +289,7 @@ def test_failed_download_keeps_waiting_and_says_so(rig):
     rig.wait_idle()
     rig.controller.download_needed_model()
     rig.wait(lambda: "下载失败" in rig.controller.state.notice)
+    rig.wait_idle()
     assert rig.controller.state.model_needed == "large-v3"
     assert rig.store.load_all()[0].stage is Stage.WAITING_MODEL
 
@@ -318,6 +319,7 @@ def test_shutdown_while_recording_saves_the_recording_for_next_time(rig):
     job = rig.store.load_all()[0]
     assert job.stage is Stage.TRANSCRIBING
     assert job.audio_path.stat().st_size > 44
+    assert all(state.pending == 0 for state in rig.states)  # closing never starts the work
 
 
 def test_settings_store_round_trip_and_defaults(tmp_path):
@@ -388,6 +390,37 @@ def test_recording_that_had_to_stop_by_itself_is_transcribed_and_explained(rig, 
     job = rig.store.load_all()[0]
     assert job.stage is Stage.DONE
     assert any("磁盘" in state.notice for state in rig.states)
+
+
+def _state_when_recording_stopped(states):
+    was_recording = False
+    for state in states:
+        if state.recording:
+            was_recording = True
+        elif was_recording:
+            return state
+    raise AssertionError("the recording never stopped")
+
+
+def test_stopped_recording_is_never_shown_as_idle_before_it_is_queued(rig):
+    """Otherwise the window briefly says nothing is happening, and anything waiting for idle sees the job unfinished."""
+    rig.controller.start()
+    rig.controller.toggle_recording()
+    rig.wait(lambda: rig.controller.recording_seconds() >= 0.25)
+    rig.controller.toggle_recording()
+    rig.wait_idle()
+    assert _state_when_recording_stopped(rig.states).pending == 1
+
+
+def test_recording_that_stopped_by_itself_is_never_shown_as_idle_before_it_is_queued(rig, monkeypatch):
+    _disk_fails_after(monkeypatch, 4)
+    rig.controller.start()
+    rig.controller.toggle_recording()
+    rig.wait(lambda: rig.controller.state.recording is False)
+    rig.wait(lambda: rig.store.load_all()[0].stage is Stage.DONE)
+    stopped = _state_when_recording_stopped(rig.states)
+    assert stopped.pending == 1
+    assert "磁盘" in stopped.notice  # the reason is already there when the button changes back
 
 
 def test_stop_ends_the_recording_even_if_the_file_cannot_be_finished(rig, monkeypatch):
@@ -524,3 +557,152 @@ def test_recording_with_no_sound_is_not_offered_for_retry(rig):
     rig.wait_idle()
     assert rig.store.load_all()[0].stage is Stage.FAILED
     assert rig.controller.state.failed == 0
+
+
+def _unusable_output(rig):
+    blocker = rig.tmp_path / "unplugged"
+    blocker.write_text("a file where the folder should be", encoding="utf-8")
+    current = rig.controller.settings
+    rig.controller.update_settings(Settings(blocker / "out", current.transcribe_model, current.proofread_model))
+
+
+def test_record_with_an_unusable_save_folder_says_why(rig):
+    _unusable_output(rig)
+    rig.controller.start()
+    rig.controller.toggle_recording()
+    assert rig.controller.state.recording is False
+    assert "保存文件夹" in rig.controller.state.notice and "设置" in rig.controller.state.notice
+    assert rig.store.load_all() == []
+
+
+def test_adding_files_with_an_unusable_save_folder_says_why(rig):
+    _unusable_output(rig)
+    rig.controller.start()
+    rig.controller.add_files([rig.source("a.mp3"), rig.source("b.mp3"), rig.tmp_path / "x.docx"])
+    notice = rig.controller.state.notice
+    assert "保存文件夹" in notice and "a.mp3" in notice and "b.mp3" in notice
+    assert str(rig.controller.settings.output_dir) in notice
+    folder_line, refused_line = notice.split("\n")
+    assert "x.docx" not in folder_line and "x.docx" in refused_line
+    assert rig.store.load_all() == []
+
+
+def _job_records_fail(rig, fails):
+    real_save = rig.store.save
+
+    def save(job):
+        if fails(job):
+            raise OSError(28, "No space left on device")
+        real_save(job)
+
+    rig.store.save = save
+
+
+def _output_contents(rig):
+    folder = rig.controller.settings.output_dir
+    return sorted(p.name for p in folder.iterdir()) if folder.exists() else []
+
+
+def test_adding_a_file_when_job_records_cannot_be_written_says_why(rig):
+    _job_records_fail(rig, lambda job: job.audio_path.name == "b.mp3")
+    rig.transcriber.gate = threading.Event()  # a.mp3 must not finish and replace the notice first
+    rig.controller.start()
+    rig.controller.add_files([rig.source("a.mp3"), rig.source("b.mp3")])
+    notice = rig.controller.state.notice
+    rig.transcriber.gate.set()
+    assert "b.mp3" in notice and "程序自己的数据文件夹" in notice and "a.mp3" not in notice
+    assert "保存文件夹" not in notice  # the save folder is fine; blaming it would mislead
+    rig.wait_idle()
+    assert [job.stage for job in rig.store.load_all()] == [Stage.DONE]
+    assert _output_contents(rig) == ["a"]  # no empty folder left for b
+
+
+def test_record_when_job_records_cannot_be_written_says_why(rig):
+    _job_records_fail(rig, lambda job: True)
+    rig.controller.start()
+    rig.controller.toggle_recording()
+    assert rig.controller.state.recording is False
+    assert "没有开始录音" in rig.controller.state.notice
+    assert "程序自己的数据文件夹" in rig.controller.state.notice
+    assert _output_contents(rig) == []
+
+
+def test_worker_keeps_going_when_a_job_record_cannot_be_saved(rig):
+    """Without this the window says "working" forever and nothing else is processed."""
+    rig.controller.start()
+    rig.controller.add_files([rig.source("a.mp3")])
+    rig.wait_idle()
+    _job_records_fail(rig, lambda job: job.attempts == 1 and job.audio_path.name == "b.mp3")
+    rig.controller.add_files([rig.source("b.mp3"), rig.source("c.mp3")])
+    rig.wait_idle()
+    stages = {job.audio_path.name: job.stage for job in rig.store.load_all()}
+    assert stages == {"a.mp3": Stage.DONE, "b.mp3": Stage.TRANSCRIBING, "c.mp3": Stage.DONE}
+    assert any("b" in s.notice and "程序自己的数据文件夹" in s.notice for s in rig.states)
+
+
+def test_job_waiting_for_a_model_keeps_the_data_folder_notice(rig):
+    rig.transcriber.missing.add("large-v3")
+    rig.controller.start()
+    rig.controller.add_files([rig.source("a.mp3")])
+    rig.wait_idle()
+    _job_records_fail(rig, lambda job: job.attempts == 1)
+    rig.controller.download_needed_model()
+    rig.wait(lambda: "程序自己的数据文件夹" in rig.controller.state.notice)
+    rig.wait_idle()
+    assert "程序自己的数据文件夹" in rig.controller.state.notice
+    assert rig.store.load_all()[0].attempts == 0
+
+
+@pytest.mark.parametrize("stop_by_itself", [False, True])
+def test_recording_stop_with_unwritable_job_records_does_not_stick(rig, monkeypatch, stop_by_itself):
+    """The disk can fill during a recording; the button must still come back."""
+    if stop_by_itself:
+        _disk_fails_after(monkeypatch, 4)
+    _job_records_fail(rig, lambda job: job.stage is not Stage.RECORDING)  # before: the self-stop does not wait
+    rig.controller.start()
+    rig.controller.toggle_recording()
+    rig.wait(lambda: rig.controller.recording_seconds() >= 0.05)
+    if not stop_by_itself:
+        rig.controller.toggle_recording()
+    rig.wait(lambda: rig.controller.state.recording is False)
+    assert "程序自己的数据文件夹" in rig.controller.state.notice
+    assert rig.store.load_all()[0].stage is Stage.RECORDING  # repaired and transcribed at the next start
+    rig.controller.toggle_recording()
+    assert rig.controller.state.recording is True  # and recording again works
+
+
+def test_finished_job_that_cannot_be_saved_says_why(rig):
+    _job_records_fail(rig, lambda job: job.stage in (Stage.DONE, Stage.FAILED))  # the disk filled up during the job
+    rig.controller.start()
+    rig.controller.add_files([rig.source("a.mp3")])
+    rig.wait(lambda: "程序自己的数据文件夹" in rig.controller.state.notice)
+    rig.wait_idle()
+    assert "程序自己的数据文件夹" in rig.controller.state.notice
+    assert rig.controller.state.pending == 0
+
+
+def test_pending_count_survives_a_file_added_while_another_job_finishes(rig):
+    """The window must not say "ready" while work is queued, nor "working" forever."""
+    entered, release = threading.Event(), threading.Event()
+    real_unfinished = rig.store.unfinished
+
+    def unfinished():
+        if threading.current_thread().name == "jobs" and not release.is_set():
+            entered.set()
+            release.wait(5)
+        return real_unfinished()
+
+    rig.store.unfinished = unfinished
+    rig.controller.start()
+    rig.controller.add_files([rig.source("a.mp3")])
+    assert entered.wait(5)  # a.mp3 is finishing
+    rig.controller.add_files([rig.source("c.mp3")])
+    release.set()
+    rig.wait(lambda: rig.controller.state.notice.startswith("完成：c"))
+    assert rig.controller.state.pending == 0
+    assert all(state.pending >= 0 for state in rig.states)
+
+
+def test_unexpected_error_is_reported_in_plain_words(rig):
+    rig.controller.report_unexpected_error()
+    assert "日志" in rig.controller.state.notice

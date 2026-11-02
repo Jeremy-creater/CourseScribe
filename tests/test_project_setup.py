@@ -173,3 +173,47 @@ def test_repository_holds_no_personal_absolute_paths():
             if pattern.search(path.read_text(encoding="utf-8")):
                 offenders.append(name)
     assert offenders == []
+
+
+def test_unexpected_errors_in_the_window_reach_the_log_and_the_user(caplog, monkeypatch):
+    import logging
+    import sys
+    import threading
+
+    from coursescribe.ui.app import install_error_reporting
+
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    told = []
+    install_error_reporting(lambda: told.append("told"))
+    try:
+        raise RuntimeError("from a button")
+    except RuntimeError as exc:
+        with caplog.at_level(logging.ERROR):
+            sys.excepthook(type(exc), exc, exc.__traceback__)
+    assert "from a button" in caplog.text
+    assert told == ["told"]
+
+
+def test_unexpected_errors_on_a_background_thread_reach_the_log_and_the_user(caplog, monkeypatch):
+    """A packaged program has no console, so the default (printing) shows nothing."""
+    import logging
+    import sys
+    import threading
+
+    from coursescribe.ui.app import install_error_reporting
+
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    told = []
+    install_error_reporting(lambda: told.append("told"))
+
+    def fail():
+        raise RuntimeError("from the worker")
+
+    with caplog.at_level(logging.ERROR):
+        thread = threading.Thread(target=fail)
+        thread.start()
+        thread.join()
+    assert "from the worker" in caplog.text
+    assert told == ["told"]

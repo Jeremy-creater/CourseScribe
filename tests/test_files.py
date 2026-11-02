@@ -88,11 +88,112 @@ def test_interrupted_json_write_keeps_the_old_content(tmp_path, monkeypatch):
     target = tmp_path / "state.json"
     atomic_write_json(target, {"v": 1})
 
+    calls = []
+
     def broken_replace(src, dst):
+        calls.append(dst)
         raise OSError("power cut")
 
     monkeypatch.setattr("coursescribe.files.os.replace", broken_replace)
     with pytest.raises(OSError):
         atomic_write_json(target, {"v": 2})
+    assert len(calls) == 1  # only a file held open by someone else is worth waiting for
     assert json.loads(target.read_text(encoding="utf-8")) == {"v": 1}
     assert [p.name for p in tmp_path.iterdir()] == ["state.json"]
+
+
+def _held_open():
+    """What Windows reports while another program has the file open."""
+    return PermissionError(13, "Permission denied")
+
+
+@pytest.fixture
+def files_can_be_held(monkeypatch):
+    monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", True)
+
+
+def test_json_save_waits_out_a_reader_that_briefly_holds_the_file(tmp_path, monkeypatch, files_can_be_held):
+    """Windows refuses to replace a file another program has open, such as antivirus."""
+    import os
+
+    target = tmp_path / "job.json"
+    atomic_write_json(target, {"a": 1})
+    real_replace = os.replace
+    refusals = []
+
+    def busy_then_free(src, dst):
+        if len(refusals) < 2:
+            refusals.append(dst)
+            raise _held_open()
+        real_replace(src, dst)
+
+    monkeypatch.setattr("coursescribe.files.os.replace", busy_then_free)
+    atomic_write_json(target, {"a": 2})
+    assert read_json(target) == {"a": 2}
+    assert len(refusals) == 2
+    assert [p.name for p in tmp_path.iterdir()] == ["job.json"]
+
+
+def test_json_save_gives_up_on_a_file_that_stays_locked(tmp_path, monkeypatch, files_can_be_held):
+    target = tmp_path / "job.json"
+    atomic_write_json(target, {"a": 1})
+
+    def always_busy(src, dst):
+        raise _held_open()
+
+    monkeypatch.setattr("coursescribe.files.os.replace", always_busy)
+    monkeypatch.setattr("coursescribe.files._REPLACE_WAIT", 0.001)
+    with pytest.raises(PermissionError):
+        atomic_write_json(target, {"a": 2})
+    assert read_json(target) == {"a": 1}
+    assert [p.name for p in tmp_path.iterdir()] == ["job.json"]
+
+
+def test_json_save_does_not_wait_where_files_cannot_be_held(tmp_path, monkeypatch):
+    """On a Mac a refusal is a read-only folder or a privacy block, which will not clear by waiting."""
+    monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", False)
+    target = tmp_path / "job.json"
+    calls = []
+
+    def denied(src, dst):
+        calls.append(dst)
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("coursescribe.files.os.replace", denied)
+    with pytest.raises(PermissionError):
+        atomic_write_json(target, {"a": 2})
+    assert len(calls) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+def _briefly_held(monkeypatch, times):
+    from pathlib import Path
+
+    real_read = Path.read_text
+    refusals = []
+
+    def read_text(self, *args, **kwargs):
+        if len(refusals) < times:
+            refusals.append(self)
+            raise _held_open()
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr("coursescribe.files._REPLACE_WAIT", 0.001)
+    return refusals
+
+
+def test_json_read_waits_out_a_brief_hold(tmp_path, monkeypatch, files_can_be_held):
+    target = tmp_path / "job.json"
+    atomic_write_json(target, {"a": 1})
+    refusals = _briefly_held(monkeypatch, 2)
+    assert read_json(target) == {"a": 1}
+    assert len(refusals) == 2
+
+
+def test_json_read_gives_up_on_a_file_that_stays_held(tmp_path, monkeypatch, files_can_be_held):
+    target = tmp_path / "job.json"
+    atomic_write_json(target, {"a": 1})
+    _briefly_held(monkeypatch, 1000)
+    with pytest.raises(PermissionError):
+        read_json(target)

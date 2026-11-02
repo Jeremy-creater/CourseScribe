@@ -12,6 +12,9 @@ from pathlib import Path
 
 import numpy as np
 
+# A program holding a file open can shut everyone else out for a moment (antivirus, indexer).
+FILES_CAN_BE_HELD = True
+
 _SAMPLE_RATE = 48000
 _CHANNELS = 2
 _COINIT_MULTITHREADED = 0

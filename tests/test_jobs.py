@@ -82,5 +82,38 @@ def test_a_damaged_state_file_does_not_stop_the_other_jobs(tmp_path):
     assert store.load_all() == [good]
 
 
+def _hold_without_sharing(path, seconds):
+    """Open ``path`` the way antivirus or another program can on Windows: nobody else may read it.
+
+    Other systems have no such hold, so there the file is simply readable, which is the right outcome too.
+    """
+    import os
+    import threading
+
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    generic_read, no_sharing, open_existing = 0x80000000, 0, 3
+    handle = kernel32.CreateFileW(str(path), generic_read, no_sharing, None, open_existing, 0, None)
+    assert handle not in (None, wintypes.HANDLE(-1).value), ctypes.get_last_error()
+    threading.Timer(seconds, kernel32.CloseHandle, [handle]).start()
+
+
+def test_a_state_file_held_open_by_another_program_is_still_listed(tmp_path):
+    store = JobStore(tmp_path / "state")
+    job = _record(tmp_path)
+    store.save(job)
+    _hold_without_sharing(store.folder / f"{job.job_id}.json", 0.2)
+    assert store.load_all() == [job]
+
+
 def test_store_on_a_missing_folder_is_empty(tmp_path):
     assert JobStore(tmp_path / "nothing").load_all() == []

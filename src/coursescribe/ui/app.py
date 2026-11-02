@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
+import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import QLockFile, QUrl
@@ -42,6 +44,28 @@ def _set_up_logging(home: Path) -> None:
     logging.basicConfig(level=logging.INFO, handlers=[handler])
 
 
+def install_error_reporting(notify: Callable[[], None] | None = None) -> None:
+    """Errors nobody caught: a packaged program has no console, so log them and tell the user."""
+
+    def report(info) -> None:
+        logger.error("Unexpected error", exc_info=info)
+        if notify is not None:
+            try:
+                notify()
+            except Exception:
+                logger.exception("Could not show the unexpected error")
+
+    def on_window_error(kind, error, trace) -> None:
+        report((kind, error, trace))
+
+    def on_thread_error(args) -> None:
+        if args.exc_type is not SystemExit:
+            report((args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = on_window_error
+    threading.excepthook = on_thread_error
+
+
 def _choose_files(parent) -> list[Path]:
     patterns = " ".join(f"*{suffix}" for suffix in sorted(MEDIA_SUFFIXES))
     names, _ = QFileDialog.getOpenFileNames(parent, "选择音视频文件", "", f"音视频文件 ({patterns})")
@@ -60,6 +84,7 @@ def run() -> int:
     home = app_home()
     home.mkdir(parents=True, exist_ok=True)
     _set_up_logging(home)
+    install_error_reporting()
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     prepare_gpu_libraries()
 
@@ -81,6 +106,7 @@ def run() -> int:
         download_model=download_whisper_model,
         stopping=stopping,
     )
+    install_error_reporting(controller.report_unexpected_error)
     window = None
 
     def confirm(question: str) -> bool:

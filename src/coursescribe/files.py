@@ -5,8 +5,18 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+from coursescribe.platform import FILES_CAN_BE_HELD
+
+_REPLACE_TRIES = 20
+_REPLACE_WAIT = 0.05  # seconds; one second in all is far longer than a reader holds a small file
+# Where a held file shuts others out, it is reported the same way as a real refusal
+# (reads do not even carry the Windows error code), so every refusal gets a short wait.
+_FILES_CAN_BE_HELD = FILES_CAN_BE_HELD
 
 
 def _numbered(path: Path, number: int) -> Path:
@@ -97,11 +107,23 @@ def atomic_write_json(path: Path, value: Any) -> None:
     data = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
     temp = _write_temp(path.parent, data)
     try:
-        os.replace(temp, path)
+        _patiently(lambda: os.replace(temp, path))
     except BaseException:
         temp.unlink(missing_ok=True)
         raise
 
 
+def _patiently(action: Callable[[], Any]) -> Any:
+    """Windows refuses while another program (antivirus, indexer, our own save) has the file open."""
+    for _ in range(_REPLACE_TRIES - 1):
+        try:
+            return action()
+        except PermissionError:
+            if not _FILES_CAN_BE_HELD:
+                raise  # elsewhere a refusal is real and does not clear by waiting
+            time.sleep(_REPLACE_WAIT)
+    return action()
+
+
 def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(_patiently(lambda: path.read_text(encoding="utf-8")))
