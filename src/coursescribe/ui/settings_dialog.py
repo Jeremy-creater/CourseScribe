@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 
 from coursescribe.models import MODELS, model_size_label
 from coursescribe.settings import Settings
+from coursescribe.ui.style import set_role
 
 
 class SettingsDialog(QDialog):
@@ -40,6 +41,7 @@ class SettingsDialog(QDialog):
             self.transcribe_box.addItem(name, name)
         self.transcribe_box.setCurrentText(current.transcribe_model)
         self.size_label = QLabel()
+        self.size_label.setProperty("muted", True)
         self.transcribe_box.currentTextChanged.connect(self._show_size)
         self._show_size(self.transcribe_box.currentText())
 
@@ -58,16 +60,23 @@ class SettingsDialog(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("保存")
+        set_role(buttons.button(QDialogButtonBox.Ok), "primary")
         buttons.button(QDialogButtonBox.Cancel).setText("取消")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+        note = QLabel("修改后，从下一个任务开始生效。")
+        note.setProperty("muted", True)
+
         form = QFormLayout(self)
+        form.setContentsMargins(24, 22, 24, 18)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(10)
         form.addRow("转录模型", self.transcribe_box)
         form.addRow("", self.size_label)
         form.addRow("校对模型", self.proofread_box)
         form.addRow("保存到", folder_row)
-        form.addRow(QLabel("修改后，从下一个任务开始生效。"))
+        form.addRow(note)
         form.addRow(buttons)
 
     def _show_size(self, name: str) -> None:

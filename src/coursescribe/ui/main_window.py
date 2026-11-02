@@ -7,6 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
+    QFrame,
     QHBoxLayout,
     QLabel,
     QProgressBar,
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from coursescribe.controller import AppController, AppState
 from coursescribe.ui.settings_dialog import SettingsDialog
+from coursescribe.ui.style import set_role
 
 _PROGRESS_STEPS = 1000
 _SILENCE_TEXT = "已经 30 秒没有录到声音。请确认课程正在播放、没有静音。"
@@ -25,6 +27,11 @@ _SILENCE_TEXT = "已经 30 秒没有录到声音。请确认课程正在播放�
 def _hidden(widget):
     widget.setVisible(False)
     return widget
+
+
+def _muted(label: QLabel) -> QLabel:
+    label.setProperty("muted", True)
+    return label
 
 
 class MainWindow(QWidget):
@@ -47,33 +54,45 @@ class MainWindow(QWidget):
         self._open_folder = open_folder
         self._list_proofread_models = list_proofread_models
         self.setWindowTitle("CourseScribe")
+        self.setObjectName("mainWindow")
         self.setAcceptDrops(True)
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(420)
+
+        title = QLabel("CourseScribe")
+        title.setObjectName("title")
+        subtitle = _muted(QLabel("录下网课的声音，或选择音视频文件，自动得到文字稿"))
+        subtitle.setWordWrap(True)
 
         self.record_button = QPushButton("开始录音")
-        self.record_button.setMinimumHeight(44)
+        self.record_button.setMinimumHeight(48)
+        set_role(self.record_button, "primary")
         self.record_button.clicked.connect(self.controller.toggle_recording)
         self.files_button = QPushButton("选择文件")
-        self.files_button.setMinimumHeight(44)
+        self.files_button.setMinimumHeight(38)
         self.files_button.clicked.connect(self._pick_files)
         self.settings_button = QPushButton("设置")
-        self.settings_button.setMinimumHeight(44)
+        self.settings_button.setMinimumHeight(38)
         self.settings_button.clicked.connect(self._open_settings)
         buttons = QHBoxLayout()
-        buttons.addWidget(self.record_button, 2)
+        buttons.setSpacing(10)
         buttons.addWidget(self.files_button, 2)
         buttons.addWidget(self.settings_button, 1)
 
-        self.hotkey_label = QLabel(f"快捷键 {hotkey_label}，也可以把文件拖到这里" if hotkey_label else "可以把文件拖到这里")
-        self.hotkey_label.setStyleSheet("color: gray;")
+        self.hotkey_label = _muted(
+            QLabel(f"快捷键 {hotkey_label}，也可以把文件拖到这里" if hotkey_label else "可以把文件拖到这里")
+        )
+        self.hotkey_label.setAlignment(Qt.AlignCenter)
         self.recording_label = _hidden(QLabel())
+        self.recording_label.setObjectName("recording")
         self.silence_label = _hidden(QLabel(_SILENCE_TEXT))
+        self.silence_label.setObjectName("silence")
         self.silence_label.setWordWrap(True)
-        self.silence_label.setStyleSheet("color: #c0392b; font-weight: bold;")
         self.status_label = QLabel("准备好了")
+        self.status_label.setObjectName("status")
+        self.status_label.setWordWrap(True)
         self.progress_bar = _hidden(QProgressBar())
         self.progress_bar.setTextVisible(False)
-        self.notice_label = _hidden(QLabel())
+        self.notice_label = _hidden(_muted(QLabel()))
         self.notice_label.setWordWrap(True)
         self.notice_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
@@ -84,20 +103,35 @@ class MainWindow(QWidget):
         self.open_button = _hidden(QPushButton("打开文件夹"))
         self.open_button.clicked.connect(self._open_last_folder)
         actions = QHBoxLayout()
+        actions.setSpacing(8)
         actions.addWidget(self.retry_button)
         actions.addWidget(self.download_button)
         actions.addWidget(self.open_button)
+        actions.addStretch(1)
+
+        self.status_card = QFrame()
+        self.status_card.setObjectName("card")
+        card = QVBoxLayout(self.status_card)
+        card.setContentsMargins(16, 14, 16, 14)
+        card.setSpacing(8)
+        card.addWidget(self.recording_label)
+        card.addWidget(self.status_label)
+        card.addWidget(self.progress_bar)
+        card.addWidget(self.notice_label)
+        card.addLayout(actions)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addSpacing(4)
+        layout.addWidget(self.record_button)
         layout.addLayout(buttons)
-        layout.addWidget(self.hotkey_label)
-        layout.addWidget(self.recording_label)
         layout.addWidget(self.silence_label)
-        layout.addWidget(self.status_label)
-        layout.addWidget(self.progress_bar)
-        layout.addWidget(self.notice_label)
-        layout.addLayout(actions)
+        layout.addWidget(self.status_card)
         layout.addStretch(1)
+        layout.addWidget(self.hotkey_label)
 
         self.hotkey_pressed.connect(self.controller.toggle_recording)
         self._state_changed.connect(self._show_state)
@@ -110,6 +144,7 @@ class MainWindow(QWidget):
 
     def _show_state(self, state: AppState) -> None:
         self.record_button.setText("停止录音" if state.recording else "开始录音")
+        set_role(self.record_button, "danger" if state.recording else "primary")
         self.recording_label.setVisible(state.recording)
         self.silence_label.setVisible(state.silence_warning)
         queued = state.pending - 1

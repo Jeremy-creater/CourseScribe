@@ -25,6 +25,7 @@ from coursescribe.proofread import OllamaProofreader
 from coursescribe.settings import SettingsStore, app_home, default_settings
 from coursescribe.transcribe import WhisperTranscriber, download_whisper_model
 from coursescribe.ui.main_window import MainWindow
+from coursescribe.ui.style import apply_style
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ def run() -> int:
     prepare_gpu_libraries()
 
     app = QApplication([])
-    app.setStyle("Fusion")  # the same look on Windows and Mac, and the one the tests run
+    apply_style(app)
     lock = QLockFile(str(home / "running.lock"))
     if not lock.tryLock(0):
         QMessageBox.information(None, "CourseScribe", "CourseScribe 已经打开了。")

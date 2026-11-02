@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication
 
 from coursescribe.settings import Settings
 from coursescribe.ui.main_window import MainWindow
+from coursescribe.ui.style import ARROW_IMAGE, COLORS, STYLE_SHEET, apply_style
 from coursescribe.ui.settings_dialog import SettingsDialog
 from test_controller import Rig
 
@@ -22,7 +23,7 @@ from test_controller import Rig
 @pytest.fixture(scope="module")
 def qt_app():
     app = QApplication.instance() or QApplication([])
-    app.setStyle("Fusion")
+    apply_style(app)  # what the real program does
     yield app
 
 
@@ -273,3 +274,57 @@ def test_settings_button_saves_through_the_dialog(screen, tmp_path, monkeypatch)
     screen.window.settings_button.click()
     assert screen.rig.controller.settings.transcribe_model == "medium"
     assert screen.rig.settings.load().output_dir == tmp_path / "picked"
+
+
+def _middle_colour(widget):
+    image = widget.grab().toImage()
+    return image.pixelColor(8, image.height() // 2).name()
+
+
+class TestLook:
+    """Light, solid Apple-like look, whatever the system theme."""
+
+    def test_the_window_is_light_even_under_a_dark_system_theme(self, qt_app):
+        from PySide6.QtGui import QColor, QPalette
+
+        dark = QPalette()
+        dark.setColor(QPalette.Window, QColor("#1e1e1e"))
+        dark.setColor(QPalette.WindowText, QColor("#ffffff"))
+        qt_app.setPalette(dark)
+        apply_style(qt_app)
+        assert qt_app.palette().color(QPalette.Window).name() == COLORS["background"]
+        assert qt_app.palette().color(QPalette.WindowText).name() == COLORS["text"]
+
+    def test_window_background_is_solid_and_light(self, screen):
+        assert _middle_colour(screen.window) == COLORS["background"]
+
+    def test_record_button_is_blue_then_red_while_recording(self, screen):
+        assert _middle_colour(screen.window.record_button) == COLORS["accent"]
+        screen.window.record_button.click()
+        screen.wait(lambda: screen.window.record_button.text() == "停止录音")
+        assert _middle_colour(screen.window.record_button) == COLORS["danger"]
+        screen.window.record_button.click()
+        screen.wait(lambda: screen.window.record_button.text() == "开始录音")
+        assert _middle_colour(screen.window.record_button) == COLORS["accent"]
+        screen.idle()
+
+    def test_other_buttons_are_quiet_grey(self, screen):
+        assert _middle_colour(screen.window.files_button) == COLORS["control"]
+        assert _middle_colour(screen.window.settings_button) == COLORS["control"]
+
+    def test_status_sits_on_a_white_card(self, screen):
+        assert _middle_colour(screen.window.status_card) == COLORS["surface"]
+
+    def test_combo_box_arrow_image_is_real(self):
+        from PySide6.QtGui import QImage
+
+        assert ARROW_IMAGE.as_posix() in STYLE_SHEET
+        assert not QImage(str(ARROW_IMAGE)).isNull()
+
+    def test_settings_save_button_is_blue(self, tmp_path, qt_app):
+        from PySide6.QtWidgets import QDialogButtonBox
+
+        dialog = SettingsDialog(Settings(tmp_path, "large-v3", "model-a"), ["model-a"], choose_folder=lambda: None)
+        dialog.show()
+        save = dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok)
+        assert _middle_colour(save) == COLORS["accent"]

@@ -25,7 +25,9 @@ analysis = Analysis(
     [str(ROOT / "packaging" / "entry.py")],
     pathex=[str(ROOT / "src")],
     binaries=collect_dynamic_libs("ctranslate2") + collect_dynamic_libs("onnxruntime") + gpu_binaries,
-    datas=collect_data_files("faster_whisper") + collect_data_files("soundcard"),
+    datas=collect_data_files("faster_whisper")
+    + collect_data_files("soundcard")
+    + [(str(ROOT / "src" / "coursescribe" / "ui" / "chevron.svg"), "coursescribe/ui")],
     hiddenimports=["soundcard.mediafoundation", "_cffi_backend", "coursescribe.ui.app"],
     excludes=["tkinter", "matplotlib", "pytest", "IPython", "torch"],
 )

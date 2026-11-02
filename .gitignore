@@ -23,3 +23,6 @@ coverage*.json
 
 # Claude Code and tdd-guardian files live in a separate private repository
 /.claude/
+
+# private sample lessons kept next to the code for local evaluation
+/Temp/
