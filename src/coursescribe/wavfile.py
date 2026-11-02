@@ -13,6 +13,8 @@ _BITS = 16
 _RIFF_SIZE_AT = 4
 _DATA_SIZE_AT = 40
 _FLUSH_EVERY_SECONDS = 1.0
+# The header stores sizes in 32 bits; stop a little short so every block size fits.
+MAX_DATA_BYTES = (0xFFFFFFFF - 36) // 64 * 64  # about 6.2 hours of 48 kHz stereo
 
 
 def _header(rate: int, channels: int, data_bytes: int) -> bytes:
@@ -28,9 +30,10 @@ def _header(rate: int, channels: int, data_bytes: int) -> bytes:
 class WavWriter:
     """Appends 16-bit audio and forces it to disk about once per second of sound."""
 
-    def __init__(self, path: Path, rate: int, channels: int) -> None:
+    def __init__(self, path: Path, rate: int, channels: int, max_data_bytes: int = MAX_DATA_BYTES) -> None:
         self.rate = rate
         self.channels = channels
+        self._max_data_bytes = max_data_bytes
         self._stream = path.open("xb")
         self._stream.write(_header(rate, channels, 0))
         self._data_bytes = 0
@@ -40,12 +43,18 @@ class WavWriter:
     def seconds(self) -> float:
         return self._data_bytes / (self.channels * _BITS // 8) / self.rate
 
-    def write(self, frames: np.ndarray) -> None:
-        self._stream.write(frames.astype("<i2").tobytes())
-        self._data_bytes += frames.size * _BITS // 8
-        self._unflushed_frames += len(frames)
-        if self._unflushed_frames >= self.rate * _FLUSH_EVERY_SECONDS:
+    def write(self, frames: np.ndarray) -> bool:
+        """Append ``frames``. Returns False once the file is full; the rest is not written."""
+        frame_bytes = self.channels * _BITS // 8
+        room = (self._max_data_bytes - self._data_bytes) // frame_bytes
+        fits = frames[:room]
+        self._stream.write(fits.astype("<i2").tobytes())
+        self._data_bytes += len(fits) * frame_bytes
+        self._unflushed_frames += len(fits)
+        full = len(fits) < len(frames) or self._data_bytes >= self._max_data_bytes
+        if full or self._unflushed_frames >= self.rate * _FLUSH_EVERY_SECONDS:
             self._flush()
+        return not full
 
     def _flush(self) -> None:
         self._stream.seek(_RIFF_SIZE_AT)
@@ -60,11 +69,13 @@ class WavWriter:
     def close(self) -> None:
         if self._stream.closed:
             return
-        self._flush()
-        self._stream.close()
+        try:
+            self._flush()
+        finally:
+            self._stream.close()
 
 
-def repair_wav(path: Path) -> float:
+def repair_wav(path: Path, max_data_bytes: int = MAX_DATA_BYTES) -> float:
     """Make a recording cut off by a crash readable. Returns its length in seconds.
 
     Returns 0.0, changing nothing, when the file has no usable sound.
@@ -79,7 +90,7 @@ def repair_wav(path: Path) -> float:
             block = struct.unpack("<H", head[32:34])[0]
             if not (channels and rate and block):
                 return 0.0
-            data_bytes = (size - _HEADER_SIZE) // block * block
+            data_bytes = min(size - _HEADER_SIZE, max_data_bytes) // block * block
             stream.truncate(_HEADER_SIZE + data_bytes)
             stream.seek(_RIFF_SIZE_AT)
             stream.write(struct.pack("<I", 36 + data_bytes))

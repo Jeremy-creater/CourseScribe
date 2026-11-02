@@ -191,7 +191,11 @@ class AppController:
         job = Job.new_recording(settings.output_dir, self._now(), settings.transcribe_model, settings.proofread_model)
         self.store.save(job)
         session = RecordingSession(
-            self._open_capture, job.audio_path, on_silence=self._on_silence, on_error=self._on_recording_error
+            self._open_capture,
+            job.audio_path,
+            on_silence=self._on_silence,
+            on_error=self._on_recording_error,
+            on_ended=self._on_recording_ended,
         )
         try:
             session.start()
@@ -208,11 +212,12 @@ class AppController:
         self._publish(recording=True, silence_warning=False, notice="")
 
     def _stop_recording(self) -> None:
-        session, job = self._session, self._recording_job
-        if session is None or job is None:
-            return
-        self._session = None
-        self._recording_job = None
+        with self._lock:
+            session, job = self._session, self._recording_job
+            if session is None or job is None:
+                return
+            self._session = None
+            self._recording_job = None
         seconds = session.stop()
         self._publish(recording=False, silence_warning=False)
         if seconds <= 0:
@@ -234,6 +239,11 @@ class AppController:
         self._publish(silence_warning=alerting)
 
     def _on_recording_error(self, message: str) -> None:
+        self._publish(notice=message)
+
+    def _on_recording_ended(self, message: str) -> None:
+        """The recording had to stop by itself: finish it as if the user had pressed Stop."""
+        self._stop_recording()
         self._publish(notice=message)
 
     def retry_waiting(self) -> None:

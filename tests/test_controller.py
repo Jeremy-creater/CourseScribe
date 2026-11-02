@@ -359,3 +359,45 @@ def test_clicking_retry_twice_does_not_process_a_job_twice(rig):
     rig.wait(lambda: rig.controller.state.waiting_proofread == 0)
     assert len(rig.proofreader.models) == 1
     assert rig.controller.state.pending == 0
+
+
+def _disk_fails_after(monkeypatch, writes):
+    from coursescribe import wavfile
+
+    real_write = wavfile.WavWriter.write
+    calls = []
+
+    def write(self, frames):
+        calls.append(1)
+        if len(calls) > writes:
+            raise OSError(28, "No space left on device")
+        return real_write(self, frames)
+
+    monkeypatch.setattr(wavfile.WavWriter, "write", write)
+
+
+def test_recording_that_had_to_stop_by_itself_is_transcribed_and_explained(rig, monkeypatch):
+    _disk_fails_after(monkeypatch, 4)
+    rig.controller.start()
+    rig.controller.toggle_recording()
+    rig.wait(lambda: rig.controller.state.recording is False)
+    rig.wait_idle()
+    job = rig.store.load_all()[0]
+    assert job.stage is Stage.DONE
+    assert any("磁盘" in state.notice for state in rig.states)
+
+
+def test_stop_ends_the_recording_even_if_the_file_cannot_be_finished(rig, monkeypatch):
+    from coursescribe import wavfile
+
+    def close(self):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(wavfile.WavWriter, "close", close)
+    rig.controller.start()
+    rig.controller.toggle_recording()
+    rig.wait(lambda: rig.controller.recording_seconds() >= 0.25)
+    rig.controller.toggle_recording()
+    assert rig.controller.state.recording is False
+    rig.wait_idle()
+    assert rig.store.load_all()[0].stage is Stage.DONE

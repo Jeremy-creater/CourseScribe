@@ -63,6 +63,20 @@ class TestWavWriter:
         assert len(data) == RATE * 2
         writer.close()
 
+    def test_write_stops_at_the_size_limit_and_says_so(self, tmp_path):
+        target = tmp_path / "a.wav"
+        writer = WavWriter(target, RATE, 2, max_data_bytes=RATE * 4)  # one second
+        assert writer.write(_tone(0.75)) is True
+        assert writer.write(_tone(0.5)) is False
+        writer.close()
+        _, _, data = _read(target)
+        assert len(data) == RATE * 2
+
+    def test_default_limit_keeps_the_sizes_inside_the_wav_header(self, tmp_path):
+        from coursescribe.wavfile import MAX_DATA_BYTES
+
+        assert MAX_DATA_BYTES + 36 <= 0xFFFFFFFF and MAX_DATA_BYTES % 4 == 0
+
     def test_frames_written_counts_seconds(self, tmp_path):
         writer = WavWriter(tmp_path / "a.wav", RATE, 2)
         writer.write(_tone(0.5))
@@ -108,6 +122,12 @@ class TestRepairWav:
         target.write_bytes(content)
         assert repair_wav(target) == 0.0
         assert target.read_bytes() == content
+
+    def test_file_past_the_size_limit_is_cut_to_it_instead_of_crashing(self, tmp_path):
+        target = self._crashed_file(tmp_path)
+        assert repair_wav(target, max_data_bytes=RATE * 4) == pytest.approx(1.0)
+        _, _, data = _read(target)
+        assert len(data) == RATE * 2
 
     def test_missing_file_means_no_sound(self, tmp_path):
         assert repair_wav(tmp_path / "gone.wav") == 0.0
@@ -207,13 +227,87 @@ class TestRecordingSession:
             session.start()
         assert "0x" not in str(caught.value) and "录" in str(caught.value)
 
-    def test_device_lost_midway_keeps_what_was_recorded_and_reports(self, tmp_path):
-        errors = []
-        session = RecordingSession(lambda: FakeCapture(fail_after=4), tmp_path / "a.wav", on_error=errors.append)
+    def test_device_lost_midway_reconnects_and_keeps_recording_into_the_same_file(self, tmp_path):
+        captures = [FakeCapture(fail_after=4), FakeCapture()]
+        notices, ended = [], []
+        session = RecordingSession(
+            lambda: captures.pop(0), tmp_path / "a.wav", on_error=notices.append, on_ended=ended.append,
+            reconnect_wait=0.01,
+        )
         session.start()
-        assert _wait_for(lambda: bool(errors))
-        assert "录音中断" in errors[0]
+        assert _wait_for(lambda: session.seconds >= 2.0)
+        assert "重新连接" in notices[0]
+        assert ended == []
+        seconds = session.stop()
+        _, _, data = _read(tmp_path / "a.wav")
+        assert seconds == pytest.approx(len(data) / 2 / RATE) and seconds >= 2.0
+
+    def test_device_that_never_comes_back_ends_the_recording_and_keeps_it(self, tmp_path):
+        opened = []
+
+        def open_capture():
+            if opened:
+                raise RuntimeError("no device")
+            opened.append(1)
+            return FakeCapture(fail_after=4)
+
+        ended = []
+        session = RecordingSession(open_capture, tmp_path / "a.wav", on_ended=ended.append,
+                                   reconnect_wait=0.01, reconnect_for=0.1)
+        session.start()
+        assert _wait_for(lambda: bool(ended))
+        assert "录音中断" in ended[0] and "转" in ended[0]
         assert session.stop() == pytest.approx(1.0)
+        _, _, data = _read(tmp_path / "a.wav")
+        assert len(data) == RATE * 2
+
+    def test_device_back_with_another_format_ends_the_recording(self, tmp_path):
+        other = FakeCapture()
+        other.channels = 1
+        captures = [FakeCapture(fail_after=4), other]
+        ended = []
+        session = RecordingSession(lambda: captures.pop(0), tmp_path / "a.wav", on_ended=ended.append,
+                                   reconnect_wait=0.01, reconnect_for=0.1)
+        session.start()
+        assert _wait_for(lambda: bool(ended))
+        assert session.stop() == pytest.approx(1.0)
+
+    def test_disk_error_ends_the_recording_and_stop_never_raises(self, tmp_path, monkeypatch):
+        from coursescribe import wavfile
+
+        real_write = wavfile.WavWriter.write
+        calls = []
+
+        def failing_write(self, frames):
+            calls.append(1)
+            if len(calls) > 4:
+                raise OSError(28, "No space left on device")
+            return real_write(self, frames)
+
+        def failing_close(self):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(wavfile.WavWriter, "write", failing_write)
+        monkeypatch.setattr(wavfile.WavWriter, "close", failing_close)
+        ended = []
+        session = RecordingSession(lambda: FakeCapture(), tmp_path / "a.wav", on_ended=ended.append)
+        session.start()
+        assert _wait_for(lambda: bool(ended))
+        assert "磁盘" in ended[0]
+        assert session.stop() == pytest.approx(1.0)
+        assert session.stop() == pytest.approx(1.0)
+
+    def test_recording_stops_itself_at_the_file_size_limit(self, tmp_path):
+        ended = []
+        limit = RATE * 4 * 2  # two seconds of stereo 16-bit sound
+        session = RecordingSession(lambda: FakeCapture(), tmp_path / "a.wav", on_ended=ended.append,
+                                   max_data_bytes=limit)
+        session.start()
+        assert _wait_for(lambda: bool(ended))
+        assert "上限" in ended[0]
+        assert session.stop() == pytest.approx(2.0)
+        _, _, data = _read(tmp_path / "a.wav")
+        assert len(data) == RATE * 2 * 2
 
     def test_stop_returns_even_if_the_device_hangs(self, tmp_path):
         capture = FakeCapture(stuck_after=2)
