@@ -10,6 +10,7 @@ from coursescribe.segments import Segment, segments_to_text
 from coursescribe.text import (
     chunk_text,
     clean_fillers,
+    clean_tics,
     content_chars,
     correct_terms,
     split_sentences,
@@ -206,3 +207,62 @@ class TestChunkText:
 class TestContentChars:
     def test_ignores_punctuation_space_and_width_and_case(self):
         assert content_chars("Ａ b，。 c\n1") == content_chars("a B c1")
+
+
+class TestCleanTics:
+    """Verbal tics go; everything said for its meaning stays (PRD: clean copy)."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("资产涨了三倍了\n对吧\n然后我们看\n", "资产涨了三倍了\n然后我们看\n"),
+            ("因为你过去也要学\n对不对\n那么现在\n", "因为你过去也要学\n那么现在\n"),
+            ("开始\nyeah\n这个\n那个\n对啊\n结束\n", "开始\n结束\n"),
+            ("资产至少涨了三倍了对吧\n", "资产至少涨了三倍了\n"),
+            ("留下的40%里面对吧\n真正在践行的\n", "留下的40%里面\n真正在践行的\n"),
+            ("开始\n然后呢\n结束\n", "开始\n结束\n"),
+            ("这样可以，对吧？下面继续。", "这样可以。下面继续。"),
+            ("这样可以，对吧，下面继续。", "这样可以，下面继续。"),
+        ],
+    )
+    def test_removes_tag_questions_and_pause_words(self, raw, expected):
+        assert clean_tics(raw) == expected
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("你可以观察到\n观察到的\n绝大多数人\n", "你可以\n观察到的\n绝大多数人\n"),
+            ("所以你要改变的\n改变的更多的是\n", "所以你要\n改变的更多的是\n"),
+        ],
+    )
+    def test_a_stutter_across_a_pause_is_said_once(self, raw, expected):
+        assert clean_tics(raw) == expected
+
+    @pytest.mark.parametrize(
+        "kept",
+        [
+            "行动最重要\n行动最重要\n",  # repeated on purpose
+            "不断的重复\n不断的重复\n",
+            "这个问题不难\n",
+            "那个时候我还小\n",
+            "对吧台的设计很满意\n",
+            "他说的是好的\n好的我们继续\n",  # two-character overlap is too short to call a stutter
+            "对\n就是这样\n",
+            "然后我们看第二页\n",
+        ],
+    )
+    def test_keeps_words_that_carry_meaning(self, kept):
+        assert clean_tics(kept) == kept
+
+    def test_is_stable_when_run_twice(self):
+        once = clean_tics("开始了对吧\n对不对\n你可以观察到\n观察到的人\n")
+        assert clean_tics(once) == once
+
+    def test_never_adds_or_reorders_characters(self):
+        rng = random.Random(11)
+        pieces = ["索引", "对吧", "对不对", "这个", "然后呢", "观察到", "观察到的", "\n", "，", "？", "行动", "yeah"]
+        for _ in range(500):
+            raw = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 20)))
+            cleaned = content_chars(clean_tics(raw))
+            it = iter(content_chars(raw))
+            assert all(ch in it for ch in cleaned), raw

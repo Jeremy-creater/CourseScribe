@@ -61,6 +61,64 @@ def clean_fillers(text: str) -> str:
     return "".join(out)
 
 
+_TIC_CLAUSES = frozenset(("对吧", "对不对", "对啊", "是吧", "yeah", "这个", "那个", "然后呢"))
+_TAG_ENDINGS = ("对不对", "对吧")
+_SENTENCE_ENDS = frozenset("。！？!?.…")
+_MIN_STUTTER = 3  # shorter overlaps are too often ordinary speech ("好的 / 好的我们继续")
+
+
+def _without_tag(clause: str) -> str:
+    for tag in _TAG_ENDINGS:
+        if clause.endswith(tag) and len(clause) > len(tag):
+            return clause[: -len(tag)]
+    return clause
+
+
+def _stutter_length(first: str, second: str) -> int:
+    """How much of the end of ``first`` the speaker said again at the start of ``second``."""
+    for size in range(min(len(first), len(second)) - 1, _MIN_STUTTER - 1, -1):
+        if first[-size:] == second[:size]:
+            return size
+    return 0
+
+
+def _joined_delimiter(before: str, after: str) -> str:
+    """The delimiter left when the clause between ``before`` and ``after`` disappears."""
+    if "\n" in before or "\n" in after:
+        return "\n"
+    if any(ch in _SENTENCE_ENDS for ch in after) and not any(ch in _SENTENCE_ENDS for ch in before):
+        return "。"
+    return before
+
+
+def clean_tics(text: str) -> str:
+    """Remove verbal tics: tag questions, pause words, and a stutter across a pause.
+
+    A clause that is only a tic disappears; "对吧/对不对" at the end of a clause
+    is dropped; when the start of a clause repeats the end of the one before by
+    a few characters, the earlier copy goes. Whole clauses said twice on
+    purpose stay. Characters are only ever removed, never added or moved.
+    """
+    parts = _DELIMITER_RUN.split(text)
+    clauses = [_without_tag(parts[i].strip()) if parts[i].strip() not in _TIC_CLAUSES else "" for i in range(0, len(parts), 2)]
+    delimiters = [parts[i] for i in range(1, len(parts), 2)] + [""]
+    for index in range(len(clauses) - 1):
+        size = _stutter_length(clauses[index], clauses[index + 1])
+        if size:
+            clauses[index] = clauses[index][:-size]
+    out: list[str] = []  # clause, delimiter, clause, delimiter, ...
+    for index, clause in enumerate(clauses):
+        original = parts[index * 2]
+        delimiter = delimiters[index]
+        if clause:
+            out.extend((clause if clause != original.strip() else original, delimiter))
+        elif not original:
+            out.extend(("", delimiter))
+        elif out:
+            out[-1] = _joined_delimiter(out[-1], delimiter)
+    return "".join(out)
+
+
 # Each pair is (how it may appear, how it should be written).
 _TERMS = (
     ("claude code", "Claude Code"),
