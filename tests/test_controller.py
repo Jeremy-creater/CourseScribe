@@ -402,6 +402,8 @@ def test_damaged_settings_fall_back_to_defaults(tmp_path):
 
 
 def test_default_folders_come_from_the_system(monkeypatch, tmp_path):
+    from platformdirs import user_documents_dir
+
     from coursescribe.settings import app_home, default_settings
 
     monkeypatch.delenv("COURSESCRIBE_HOME", raising=False)
@@ -409,7 +411,8 @@ def test_default_folders_come_from_the_system(monkeypatch, tmp_path):
     assert home.name == "CourseScribe"
     settings = default_settings()
     assert settings.output_dir.name == "CourseScribe"
-    assert settings.output_dir.parent.name in ("Documents", "文档")
+    # Documents, or the home folder when Documents is synced by OneDrive (test_sync_folder_desktop checks which).
+    assert settings.output_dir.parent in (Path(user_documents_dir()), Path.home())
     assert settings.transcribe_model == "large-v3"
     monkeypatch.setenv("COURSESCRIBE_HOME", str(tmp_path))
     assert app_home() == tmp_path

@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import threading
+import winreg
 from collections.abc import Callable
 from ctypes import wintypes
 from pathlib import Path
@@ -203,3 +204,28 @@ class WindowsKeepAwake:
 
 def create_keep_awake() -> WindowsKeepAwake:
     return WindowsKeepAwake()
+
+
+_ONEDRIVE_VARIABLES = ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")
+_ONEDRIVE_ACCOUNTS = r"Software\Microsoft\OneDrive\Accounts"
+
+
+def cloud_sync_roots() -> list[str]:
+    """OneDrive folders, as given: the variables are set at sign-in, the registry also after."""
+    roots = [os.environ.get(name, "") for name in _ONEDRIVE_VARIABLES]
+    try:
+        accounts = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _ONEDRIVE_ACCOUNTS)
+    except FileNotFoundError:
+        return roots
+    with accounts:
+        for index in range(winreg.QueryInfoKey(accounts)[0]):
+            try:
+                with winreg.OpenKey(accounts, winreg.EnumKey(accounts, index)) as account:
+                    folder, kind = winreg.QueryValueEx(account, "UserFolder")
+            except FileNotFoundError:
+                continue  # an account that is not set up yet has no folder
+            if kind == winreg.REG_EXPAND_SZ:
+                folder = winreg.ExpandEnvironmentStrings(folder)
+            if isinstance(folder, str):
+                roots.append(folder)
+    return roots

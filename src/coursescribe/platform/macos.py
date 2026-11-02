@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 
 def open_system_audio():
     raise NotImplementedError("System audio capture on the Mac is not built yet")
@@ -39,3 +41,8 @@ class _NoKeepAwake:
 
 def create_keep_awake() -> _NoKeepAwake:
     return _NoKeepAwake()
+
+
+def cloud_sync_roots() -> list[str]:
+    """iCloud Drive. Whether Documents itself lives there is confirmed in the Mac phase."""
+    return [str(Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs")]

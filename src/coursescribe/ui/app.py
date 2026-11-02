@@ -25,7 +25,7 @@ from coursescribe.platform import (
     prepare_gpu_libraries,
 )
 from coursescribe.proofread import OllamaProofreader
-from coursescribe.settings import SettingsStore, app_home, default_settings
+from coursescribe.settings import app_home, open_settings
 from coursescribe.transcribe import WhisperTranscriber, download_whisper_model
 from coursescribe.ui.main_window import MainWindow
 from coursescribe.ui.style import apply_style
@@ -100,7 +100,7 @@ def run() -> int:
     word_list = home / WORD_LIST_FILE
     controller = AppController(
         store=JobStore(home / "jobs"),
-        settings=SettingsStore(home / "settings.json", default_settings()),
+        settings=open_settings(home / "settings.json"),
         transcriber=WhisperTranscriber(should_stop=stopping.is_set),
         proofreader=OllamaProofreader(vocabulary=lambda: load_vocabulary(word_list)),
         open_capture=open_system_audio,
