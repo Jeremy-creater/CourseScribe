@@ -25,6 +25,10 @@ MEDIA_SUFFIXES = frozenset(
 )
 
 
+_MAX_ATTEMPTS = 2
+_PAUSED = "这个任务连续两次让程序意外退出，已暂停。可以点“重试”再试一次，或点“忽略”。"
+
+
 @dataclass(frozen=True)
 class AppState:
     recording: bool = False
@@ -34,6 +38,7 @@ class AppState:
     notice: str = ""
     pending: int = 0
     waiting_proofread: int = 0
+    failed: int = 0
     model_needed: str | None = None
     downloading: bool = False
     last_folder: Path | None = None
@@ -79,10 +84,29 @@ class AppController:
             listener(state)
 
     def start(self) -> None:
-        """Begin working, picking up whatever the last run left unfinished."""
+        """Begin working, picking up whatever the last run left unfinished.
+
+        A job that was running when the program died twice in a row is paused instead,
+        or it would take the program down at every start.
+        """
+        closed_cleanly = self.store.take_closed_cleanly()
         self._worker.start()
+        paused = []
         for job in self.store.unfinished():
+            if closed_cleanly and job.attempts:
+                job.attempts = 0
+                self.store.save(job)
+            if job.attempts >= _MAX_ATTEMPTS:
+                job.stage = Stage.FAILED
+                job.message = _PAUSED
+                self.store.save(job)
+                paused.append(job)
+                continue
             self._enqueue(job)
+        changes = self._waiting_counts()
+        if paused:
+            changes["notice"] = "、".join(job.folder.name for job in paused) + "：" + _PAUSED
+        self._publish(**changes)
 
     def shutdown(self) -> None:
         self._stop_recording()
@@ -90,6 +114,7 @@ class AppController:
         self._queue.put(None)
         if self._worker.is_alive():
             self._worker.join(2.0)
+        self.store.mark_closed_cleanly()
 
     def _enqueue(self, job: Job) -> None:
         with self._lock:
@@ -110,12 +135,16 @@ class AppController:
             self._run_job(job)
 
     def _run_job(self, job: Job) -> None:
+        job.attempts += 1
+        self.store.save(job)
         try:
             if job.stage is Stage.WAITING_MODEL and job.model_download_requested:
                 self._download(job)
             self._pipeline.run(job)
         except Exception:  # keeps the worker alive for the next job
             logger.exception("Could not process job %s", job.job_id)
+        job.attempts = 0
+        self.store.save(job)
         self._finish_job(job)
 
     def _download(self, job: Job) -> None:
@@ -155,6 +184,7 @@ class AppController:
         return {
             "waiting_proofread": sum(job.stage is Stage.WAITING_PROOFREAD for job in unfinished),
             "model_needed": needing_model[0] if needing_model else None,
+            "failed": len(self.store.failed_to_offer()),
         }
 
     def _on_job_status(self, job: Job, text: str, fraction: float | None) -> None:
@@ -223,6 +253,7 @@ class AppController:
         if seconds <= 0:
             job.stage = Stage.FAILED
             job.message = "这次录音没有留下可用的声音。"
+            job.can_retry = False
             self.store.save(job)
             self._publish(notice=job.message)
             return
@@ -254,6 +285,22 @@ class AppController:
                 self.store.save(job)
                 self._enqueue(job)
         self._publish(notice="")
+
+    def retry_failed(self) -> None:
+        """Run the failed jobs again from the step where each one stopped."""
+        for job in self.store.failed_to_offer():
+            job.stage = job.retry_stage()
+            job.message = ""
+            job.attempts = 0
+            self.store.save(job)
+            self._enqueue(job)
+        self._publish(notice="", **self._waiting_counts())
+
+    def dismiss_failed(self) -> None:
+        for job in self.store.failed_to_offer():
+            job.dismissed = True
+            self.store.save(job)
+        self._publish(notice="", **self._waiting_counts())
 
     def download_needed_model(self) -> None:
         """The user has agreed to the download; waiting jobs continue after it."""

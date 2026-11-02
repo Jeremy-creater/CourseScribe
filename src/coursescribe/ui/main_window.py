@@ -100,6 +100,10 @@ class MainWindow(QWidget):
 
         self.retry_button = _hidden(QPushButton("继续校对"))
         self.retry_button.clicked.connect(self.controller.retry_waiting)
+        self.retry_failed_button = _hidden(QPushButton("重试"))
+        self.retry_failed_button.clicked.connect(self.controller.retry_failed)
+        self.dismiss_failed_button = _hidden(QPushButton("忽略"))
+        self.dismiss_failed_button.clicked.connect(self.controller.dismiss_failed)
         self.download_button = _hidden(QPushButton())
         self.download_button.clicked.connect(self._download_model)
         self.open_button = _hidden(QPushButton("打开文件夹"))
@@ -107,6 +111,8 @@ class MainWindow(QWidget):
         actions = QHBoxLayout()
         actions.setSpacing(8)
         actions.addWidget(self.retry_button)
+        actions.addWidget(self.retry_failed_button)
+        actions.addWidget(self.dismiss_failed_button)
         actions.addWidget(self.download_button)
         actions.addWidget(self.open_button)
         actions.addStretch(1)
@@ -161,6 +167,8 @@ class MainWindow(QWidget):
         self.notice_label.setText(state.notice)
         self.notice_label.setVisible(bool(state.notice))
         self.retry_button.setVisible(state.waiting_proofread > 0 and not working)
+        self.retry_failed_button.setVisible(state.failed > 0 and not working)
+        self.dismiss_failed_button.setVisible(state.failed > 0 and not working)
         needs_download = state.model_needed is not None and not state.downloading and not working
         self.download_button.setVisible(needs_download)
         if needs_download:

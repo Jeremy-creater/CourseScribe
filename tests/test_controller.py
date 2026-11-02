@@ -41,10 +41,13 @@ class FakeTranscriber:
 class FakeProofreader:
     def __init__(self):
         self.blocked = None
+        self.error = None
         self.models = []
 
     def proofread(self, text, model, checkpoint, on_progress):
         self.models.append(model)
+        if self.error:
+            raise self.error
         if self.blocked:
             raise ProofreadBlocked(self.blocked)
         on_progress(1, 1)
@@ -401,3 +404,123 @@ def test_stop_ends_the_recording_even_if_the_file_cannot_be_finished(rig, monkey
     assert rig.controller.state.recording is False
     rig.wait_idle()
     assert rig.store.load_all()[0].stage is Stage.DONE
+
+
+def _saved_job(rig, attempts=0, stage=Stage.TRANSCRIBING):
+    job = Job.new_file(rig.source(), rig.tmp_path / "out", NOW, "large-v3", "model-a")
+    job.stage = stage
+    job.attempts = attempts
+    rig.store.save(job)
+    return job
+
+
+def test_job_that_took_the_program_down_twice_is_paused_not_resumed(rig):
+    job = _saved_job(rig, attempts=2)
+    rig.controller.start()
+    rig.wait(lambda: rig.controller.state.failed == 1)
+    assert rig.transcriber.models == []
+    saved = rig.store.load_all()[0]
+    assert saved.job_id == job.job_id and saved.stage is Stage.FAILED
+    assert "暂停" in rig.controller.state.notice and "重试" in rig.controller.state.notice
+
+
+def test_job_that_took_the_program_down_once_is_resumed(rig):
+    _saved_job(rig, attempts=1)
+    rig.controller.start()
+    rig.wait_idle()
+    assert rig.store.load_all()[0].stage is Stage.DONE
+
+
+def test_closing_the_program_normally_does_not_count_as_a_crash(tmp_path):
+    first = Rig(tmp_path)
+    _saved_job(first, attempts=2)
+    first.store.mark_closed_cleanly()
+    first.controller.start()
+    first.wait_idle()
+    assert first.store.load_all()[0].stage is Stage.DONE
+    first.controller.shutdown()
+
+
+def test_shutdown_records_a_clean_close_and_the_next_start_consumes_it(rig):
+    rig.controller.start()
+    rig.controller.shutdown()
+    assert rig.store.take_closed_cleanly() is True
+    assert rig.store.take_closed_cleanly() is False
+
+
+def test_attempts_go_back_to_zero_after_a_run_that_ends_normally(rig):
+    rig.proofreader.blocked = "没有启动"
+    _saved_job(rig, attempts=1)
+    rig.controller.start()
+    rig.wait_idle()
+    job = rig.store.load_all()[0]
+    assert job.stage is Stage.WAITING_PROOFREAD and job.attempts == 0
+
+
+def test_failed_job_retries_from_the_step_that_failed(rig):
+    rig.proofreader.error = RuntimeError("boom")
+    rig.controller.start()
+    rig.controller.add_files([rig.source()])
+    rig.wait_idle()
+    assert rig.store.load_all()[0].stage is Stage.FAILED
+    assert rig.controller.state.failed == 1
+    rig.proofreader.error = None
+    rig.transcriber.models.clear()
+    rig.controller.retry_failed()
+    rig.wait_idle()
+    job = rig.store.load_all()[0]
+    assert job.stage is Stage.DONE
+    assert rig.transcriber.models == []  # the .txt was kept, so no second transcription
+    assert job.md_path.exists()
+    assert rig.controller.state.failed == 0
+
+
+def test_failed_file_job_without_a_txt_retries_the_transcription(rig):
+    job = _saved_job(rig, stage=Stage.FAILED)
+    rig.controller.start()
+    rig.wait(lambda: rig.controller.state.failed == 1)
+    rig.controller.retry_failed()
+    rig.wait_idle()
+    assert rig.store.load_all()[0].stage is Stage.DONE
+    assert rig.transcriber.models == ["large-v3"]
+    assert job.job_id == rig.store.load_all()[0].job_id
+
+
+def test_failed_recording_retry_starts_by_checking_the_recording(rig):
+    job = Job.new_recording(rig.tmp_path / "out", NOW, "large-v3", "model-a")
+    from coursescribe.wavfile import WavWriter
+
+    writer = WavWriter(job.audio_path, 48000, 2)
+    writer.write(np.full((48000, 2), 3000, dtype=np.int16))
+    writer.close()
+    job.stage = Stage.FAILED
+    rig.store.save(job)
+    rig.controller.start()
+    rig.wait(lambda: rig.controller.state.failed == 1)
+    rig.controller.retry_failed()
+    rig.wait_idle()
+    assert rig.store.load_all()[0].stage is Stage.DONE
+
+
+def test_ignored_failures_stop_offering_a_retry(rig):
+    _saved_job(rig, stage=Stage.FAILED)
+    rig.controller.start()
+    rig.wait(lambda: rig.controller.state.failed == 1)
+    rig.controller.dismiss_failed()
+    assert rig.controller.state.failed == 0
+    rig.controller.retry_failed()
+    rig.wait_idle()
+    assert rig.store.load_all()[0].stage is Stage.FAILED
+    assert rig.transcriber.models == []
+
+
+def test_recording_with_no_sound_is_not_offered_for_retry(rig):
+    job = Job.new_recording(rig.tmp_path / "out", NOW, "large-v3", "model-a")
+    from coursescribe.wavfile import WavWriter
+
+    WavWriter(job.audio_path, 48000, 2).close()  # stopped before any sound arrived
+    rig.store.save(job)
+    rig.controller.start()
+    rig.wait_idle()
+    assert rig.store.load_all()[0].stage is Stage.FAILED
+    assert rig.controller.state.failed == 0

@@ -104,16 +104,17 @@ class Pipeline:
             logger.exception("Job %s failed", job.job_id)
             self._set(job, Stage.FAILED, "处理时出错了。录音和已有文件都还在，详情见日志。")
 
-    def _set(self, job: Job, stage: Stage, message: str = "") -> None:
+    def _set(self, job: Job, stage: Stage, message: str = "", can_retry: bool = True) -> None:
         job.stage = stage
         job.message = message
+        job.can_retry = can_retry
         self.store.save(job)
         if message:
             self.on_status(job, message, None)
 
     def _finish_interrupted_recording(self, job: Job) -> None:
         if self.repair_recording(job.audio_path) <= 0:
-            self._set(job, Stage.FAILED, "这次录音没有留下可用的声音。")
+            self._set(job, Stage.FAILED, "这次录音没有留下可用的声音。", can_retry=False)
             return
         self._set(job, Stage.TRANSCRIBING)
 
@@ -138,7 +139,7 @@ class Pipeline:
         )
         segments = read_segments(checkpoint)
         if not segments:
-            self._set(job, Stage.FAILED, "没有识别到说话的声音，所以没有生成文字稿。")
+            self._set(job, Stage.FAILED, "没有识别到说话的声音，所以没有生成文字稿。", can_retry=False)
             self.transcriber.release()
             return
         job.txt_path = commit_new_text(job.txt_path, segments_to_text(segments))

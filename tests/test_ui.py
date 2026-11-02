@@ -87,7 +87,7 @@ def test_first_view_has_only_the_main_controls(screen):
     assert window.files_button.isVisible()
     assert window.status_label.text() == "准备好了"
     assert "Ctrl+Alt+R" in window.hotkey_label.text()
-    for hidden in (window.retry_button, window.download_button, window.open_button, window.progress_bar, window.silence_label):
+    for hidden in (window.retry_button, window.retry_failed_button, window.dismiss_failed_button, window.download_button, window.open_button, window.progress_bar, window.silence_label):
         assert not hidden.isVisible()
 
 
@@ -175,6 +175,26 @@ def test_blocked_proofreading_shows_the_way_out_and_the_button_finishes_it(scree
     screen.wait(lambda: not screen.window.retry_button.isVisible())
     screen.idle()
     assert screen.rig.store.load_all()[0].md_path.exists()
+
+
+def test_failed_job_shows_retry_and_ignore_and_retry_finishes_it(screen):
+    screen.rig.proofreader.error = RuntimeError("boom")
+    screen.rig.controller.add_files([screen.rig.source()])
+    screen.wait(lambda: screen.window.retry_failed_button.isVisible())
+    assert screen.window.dismiss_failed_button.isVisible()
+    screen.rig.proofreader.error = None
+    screen.window.retry_failed_button.click()
+    screen.wait(lambda: screen.rig.store.load_all()[0].stage.value == "done")
+    screen.wait(lambda: not screen.window.retry_failed_button.isVisible())
+    assert not screen.window.dismiss_failed_button.isVisible()
+
+
+def test_ignore_hides_the_failed_job_buttons(screen):
+    screen.rig.proofreader.error = RuntimeError("boom")
+    screen.rig.controller.add_files([screen.rig.source()])
+    screen.wait(lambda: screen.window.dismiss_failed_button.isVisible())
+    screen.window.dismiss_failed_button.click()
+    screen.wait(lambda: not screen.window.retry_failed_button.isVisible())
 
 
 def test_download_states_the_size_and_respects_no(screen):

@@ -32,6 +32,7 @@ class Stage(str, Enum):
 
 
 FINISHED_STAGES = frozenset({Stage.DONE, Stage.FAILED})
+_CLOSED_CLEANLY = "closed-cleanly"
 
 
 _last_stamp = 0
@@ -62,6 +63,9 @@ class Job:
     unproofread_chunks: int = 0
     total_chunks: int = 0
     model_download_requested: bool = False
+    attempts: int = 0  # runs started and not ended normally; more than one means it crashed the program
+    can_retry: bool = True
+    dismissed: bool = False
 
     @classmethod
     def new_recording(cls, root: Path, now: datetime, transcribe_model: str, proofread_model: str) -> Job:
@@ -99,6 +103,16 @@ class Job:
             proofread_model=proofread_model,
             created_ns=_next_creation_stamp(),
         )
+
+    def retry_stage(self) -> Stage:
+        """Where a failed job picks up again: keep the transcript if there is one."""
+        if self.txt_path.is_file():
+            return Stage.PROOFREADING
+        return Stage.RECORDING if self.kind is JobKind.RECORDING else Stage.TRANSCRIBING
+
+    @property
+    def offers_retry(self) -> bool:
+        return self.stage is Stage.FAILED and self.can_retry and not self.dismissed
 
     def to_dict(self) -> dict:
         raw = asdict(self)
@@ -142,6 +156,21 @@ class JobStore:
 
     def unfinished(self) -> list[Job]:
         return [job for job in self.load_all() if job.stage not in FINISHED_STAGES]
+
+    def failed_to_offer(self) -> list[Job]:
+        return [job for job in self.load_all() if job.offers_retry]
+
+    def mark_closed_cleanly(self) -> None:
+        self.folder.mkdir(parents=True, exist_ok=True)
+        (self.folder / _CLOSED_CLEANLY).touch()
+
+    def take_closed_cleanly(self) -> bool:
+        """Whether the program was closed normally last time. Asking clears the answer."""
+        marker = self.folder / _CLOSED_CLEANLY
+        if not marker.exists():
+            return False
+        marker.unlink(missing_ok=True)
+        return True
 
     def segments_path(self, job: Job) -> Path:
         return self.folder / f"{job.job_id}.segments.jsonl"
