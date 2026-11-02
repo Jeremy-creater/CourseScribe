@@ -25,3 +25,17 @@ class _NoHotkey:
 
 def create_global_hotkey(callback) -> _NoHotkey:
     return _NoHotkey()
+
+
+class _NoKeepAwake:
+    """Keeping the Mac awake arrives in the Mac phase of the plan."""
+
+    def hold(self) -> None:
+        pass
+
+    def release(self) -> None:
+        pass
+
+
+def create_keep_awake() -> _NoKeepAwake:
+    return _NoKeepAwake()

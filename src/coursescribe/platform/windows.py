@@ -145,3 +145,61 @@ class GlobalHotkey:
 
 def create_global_hotkey(callback: Callable[[], None]) -> GlobalHotkey:
     return GlobalHotkey(callback)
+
+
+_POWER_REQUEST_SYSTEM_REQUIRED = 1
+_POWER_REQUEST_EXECUTION_REQUIRED = 3  # keeps the program running on laptops with modern standby
+_KEEP_AWAKE_KINDS = (_POWER_REQUEST_SYSTEM_REQUIRED, _POWER_REQUEST_EXECUTION_REQUIRED)
+_KEEP_AWAKE_REASON = "CourseScribe 正在录音或处理任务"
+
+
+class _ReasonContext(ctypes.Structure):
+    _fields_ = [("Version", wintypes.ULONG), ("Flags", wintypes.DWORD), ("SimpleReasonString", wintypes.LPWSTR)]
+
+
+class WindowsKeepAwake:
+    """A power request: the system stays on, the screen may still turn off, and closing the lid still sleeps.
+
+    Unlike SetThreadExecutionState it is not tied to a thread, so it can be released on
+    another thread than the one that asked.
+    """
+
+    def __init__(self) -> None:
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel32.PowerCreateRequest.restype = wintypes.HANDLE
+        self._kernel32.PowerCreateRequest.argtypes = [ctypes.POINTER(_ReasonContext)]
+        self._kernel32.PowerSetRequest.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        self._kernel32.PowerClearRequest.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._reason = _ReasonContext(0, 1, _KEEP_AWAKE_REASON)  # version 0, simple string
+        self._handle = None
+        self._lock = threading.Lock()
+
+    def hold(self) -> None:
+        with self._lock:
+            if self._handle is not None:
+                return
+            handle = self._kernel32.PowerCreateRequest(ctypes.byref(self._reason))
+            if not handle or handle == wintypes.HANDLE(-1).value:
+                raise ctypes.WinError(ctypes.get_last_error())
+            for kind in _KEEP_AWAKE_KINDS:
+                if not self._kernel32.PowerSetRequest(handle, kind):
+                    error = ctypes.WinError(ctypes.get_last_error())
+                    self._kernel32.CloseHandle(handle)  # closing also clears what was set
+                    raise error
+            self._handle = handle
+
+    def release(self) -> None:
+        with self._lock:
+            handle, self._handle = self._handle, None
+            if handle is None:
+                return
+            failed = [kind for kind in _KEEP_AWAKE_KINDS if not self._kernel32.PowerClearRequest(handle, kind)]
+            error = ctypes.WinError(ctypes.get_last_error()) if failed else None
+            self._kernel32.CloseHandle(handle)  # closing ends the request even if clearing failed
+            if error is not None:
+                raise error
+
+
+def create_keep_awake() -> WindowsKeepAwake:
+    return WindowsKeepAwake()

@@ -20,6 +20,7 @@ from coursescribe.ollama import OllamaClient, OllamaError
 from coursescribe.platform import (
     HOTKEY_LABEL,
     create_global_hotkey,
+    create_keep_awake,
     open_system_audio,
     prepare_gpu_libraries,
 )
@@ -105,6 +106,7 @@ def run() -> int:
         open_capture=open_system_audio,
         download_model=download_whisper_model,
         stopping=stopping,
+        keep_awake=create_keep_awake(),
     )
     install_error_reporting(controller.report_unexpected_error)
     window = None

@@ -10,7 +10,7 @@ import pytest
 from coursescribe.controller import AppController
 from coursescribe.jobs import JobStore, Stage
 from coursescribe.ollama import OllamaClient, OllamaDown
-from coursescribe.platform import open_system_audio, prepare_gpu_libraries
+from coursescribe.platform import create_keep_awake, open_system_audio, prepare_gpu_libraries
 from coursescribe.proofread import OllamaProofreader, is_lossless
 from coursescribe.settings import Settings, SettingsStore
 from coursescribe.text import clean_fillers
@@ -41,6 +41,7 @@ def _controller(tmp_path):
         open_capture=open_system_audio,
         download_model=download_whisper_model,
         stopping=stopping,
+        keep_awake=create_keep_awake(),
     )
 
 

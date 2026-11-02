@@ -9,6 +9,7 @@ if sys.platform == "win32":
         FILES_CAN_BE_HELD,
         HOTKEY_LABEL,
         create_global_hotkey,
+        create_keep_awake,
         open_system_audio,
         prepare_gpu_libraries,
     )
@@ -17,8 +18,9 @@ else:
         FILES_CAN_BE_HELD,
         HOTKEY_LABEL,
         create_global_hotkey,
+        create_keep_awake,
         open_system_audio,
         prepare_gpu_libraries,
     )
 
-__all__ = ["FILES_CAN_BE_HELD", "HOTKEY_LABEL", "create_global_hotkey", "open_system_audio", "prepare_gpu_libraries"]
+__all__ = ["FILES_CAN_BE_HELD", "HOTKEY_LABEL", "create_global_hotkey", "create_keep_awake", "open_system_audio", "prepare_gpu_libraries"]

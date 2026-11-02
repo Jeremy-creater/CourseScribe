@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 
 from coursescribe.jobs import Job, JobStore, Stage
 from coursescribe.models import model_size_label
@@ -31,6 +32,15 @@ def _remove_if_empty(folder: Path) -> None:
             folder.rmdir()
     except OSError:
         pass  # gone already, or not ours to clean up
+
+
+SLEEP_WARNING = "没能阻止电脑自动睡眠，录音或处理中途电脑可能会睡着。需要的话，请在系统设置里暂时关掉自动睡眠。"
+
+
+class KeepAwake(Protocol):
+    def hold(self) -> None: ...
+
+    def release(self) -> None: ...
 
 
 _MAX_ATTEMPTS = 2
@@ -62,6 +72,7 @@ class AppController:
         open_capture: Callable[[], AudioCapture],
         download_model: Callable[[str], None],
         stopping: threading.Event,
+        keep_awake: KeepAwake,
         now: Callable[[], datetime] = datetime.now,
     ) -> None:
         self.store = store
@@ -80,16 +91,53 @@ class AppController:
         self.state = AppState()
         self._session: RecordingSession | None = None
         self._recording_job: Job | None = None
+        self._keep_awake = keep_awake
+        self._awake = False  # the system has our request to stay awake
+        self._closed = False
+        self._sleep_warned = False  # the user hears about a failed request once per run
+        self._sleep_warning_shown = False  # ...and it stays in the notices of that busy period
+        self._hold_failed = False  # tried and failed in this busy period; next period tries again
 
     def add_listener(self, listener: Callable[[AppState], None]) -> None:
         self._listeners.append(listener)
 
     def _publish(self, **changes) -> None:
         with self._lock:
-            self.state = replace(self.state, **changes)
-            state = self.state
+            state = replace(self.state, **changes)
+            busy = (state.recording or state.pending > 0) and not self._closed
+            self._follow_busy(busy)
+            if self._sleep_warning_shown and SLEEP_WARNING not in state.notice:
+                notice = f"{state.notice}\n{SLEEP_WARNING}" if state.notice else SLEEP_WARNING
+                state = replace(state, notice=notice)
+            elif not self._sleep_warning_shown and SLEEP_WARNING in state.notice:
+                # the work is over; a notice carried forward no longer needs the warning
+                notice = state.notice.replace(f"\n{SLEEP_WARNING}", "").replace(SLEEP_WARNING, "")
+                state = replace(state, notice=notice)
+            self.state = state
         for listener in self._listeners:
             listener(state)
+
+    def _follow_busy(self, busy: bool) -> None:
+        """Keep the computer awake exactly while recording or working. Called under the lock."""
+        if busy and not self._awake and not self._hold_failed:
+            try:
+                self._keep_awake.hold()
+                self._awake = True
+            except Exception as exc:  # the work matters more; it goes on without the request
+                logger.warning("Could not keep the computer awake: %s", exc)
+                self._hold_failed = True
+                if not self._sleep_warned:
+                    self._sleep_warned = True
+                    self._sleep_warning_shown = True
+        elif not busy:
+            self._sleep_warning_shown = False
+            self._hold_failed = False
+            if self._awake:
+                self._awake = False
+                try:
+                    self._keep_awake.release()
+                except Exception as exc:
+                    logger.warning("Could not let the computer sleep again: %s", exc)
 
     def start(self) -> None:
         """Begin working, picking up whatever the last run left unfinished.
@@ -122,6 +170,9 @@ class AppController:
             self.store.mark_closed_cleanly()  # before the waiting below, which Windows may cut short
         except OSError as exc:
             logger.warning("Could not note the clean close: %s", exc)
+        with self._lock:
+            self._closed = True
+            self._follow_busy(False)
         self._stop_recording()
         self._queue.put(None)
         if self._worker.is_alive():

@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from coursescribe.controller import AppController
+from coursescribe.controller import SLEEP_WARNING, AppController
 from coursescribe.jobs import Job, JobStore, Stage
 from coursescribe.pipeline import ModelMissing, ProofreadBlocked, ProofreadResult
 from coursescribe.segments import Segment
@@ -42,10 +42,13 @@ class FakeProofreader:
     def __init__(self):
         self.blocked = None
         self.error = None
+        self.gate = None
         self.models = []
 
     def proofread(self, text, model, checkpoint, on_progress):
         self.models.append(model)
+        if self.gate:
+            self.gate.wait(5)
         if self.error:
             raise self.error
         if self.blocked:
@@ -77,6 +80,44 @@ class FakeCapture:
         return np.full((frames, 2), 3000, dtype=np.int16)
 
 
+class FakeKeepAwake:
+    """The system's power state as far as we are concerned: records results, not calls."""
+
+    def __init__(self):
+        self.held = False
+        self.history: list[bool] = []
+        self.violations: list[str] = []
+        self.fail_hold: Exception | None = None
+        self.fail_release: Exception | None = None
+        self.hold_attempts = 0
+        self.last_hold_failed = False
+        self.on_hold = None  # called first, to stall a hold in tests
+        self.on_release = None
+
+    def hold(self):
+        self.hold_attempts += 1
+        if self.on_hold:
+            self.on_hold()
+        if self.fail_hold:
+            self.last_hold_failed = True
+            raise self.fail_hold
+        self.last_hold_failed = False
+        if self.held:
+            self.violations.append("hold while held")
+        self.held = True
+        self.history.append(True)
+
+    def release(self):
+        if self.on_release:
+            self.on_release()
+        if not self.held:
+            self.violations.append("release while released")
+        self.held = False
+        self.history.append(False)
+        if self.fail_release:
+            raise self.fail_release
+
+
 class Rig:
     def __init__(self, tmp_path: Path, capture_fails=False):
         self.tmp_path = tmp_path
@@ -87,6 +128,7 @@ class Rig:
         self.downloads = []
         self.download_error = None
         self.states = []
+        self.awake = FakeKeepAwake()
         self.controller = AppController(
             store=self.store,
             settings=self.settings,
@@ -95,9 +137,18 @@ class Rig:
             open_capture=lambda: FakeCapture(capture_fails),
             download_model=self._download,
             stopping=threading.Event(),
+            keep_awake=self.awake,
             now=lambda: NOW,
         )
         self.controller.add_listener(self.states.append)
+        self.closed = False
+        close = self.controller.shutdown
+
+        def shutdown():
+            self.closed = True
+            close()
+
+        self.controller.shutdown = shutdown
 
     def _download(self, name):
         if self.download_error:
@@ -122,12 +173,25 @@ class Rig:
     def wait_idle(self):
         self.wait(lambda: self.controller.state.pending == 0)
 
+    def check_keep_awake_follows_busy(self):
+        """The law every scenario must keep: awake exactly while recording or working."""
+
+        def follows():
+            state = self.controller.state
+            busy = (state.recording or state.pending > 0) and not self.closed
+            return self.awake.held == busy or (busy and self.awake.last_hold_failed)
+
+        self.wait(follows, seconds=2.0)
+        assert self.awake.violations == []
+        self.controller.shutdown()
+        assert self.awake.held is False
+
 
 @pytest.fixture
 def rig(tmp_path):
     made = Rig(tmp_path)
     yield made
-    made.controller.shutdown()
+    made.check_keep_awake_follows_busy()
 
 
 def test_chosen_file_goes_all_the_way_with_no_other_action(rig):
@@ -799,6 +863,343 @@ def test_retry_and_ignore_with_unwritable_job_records_say_why(rig, action, stage
     assert rig.store.load_all()[0].stage is stage
     assert rig.controller.state.failed == (1 if stage is Stage.FAILED else 0)  # still offered
     assert rig.controller.state.pending == 0
+
+
+# --- keeping the computer awake (docs/plans/M2-keep-awake-tests.md) ---
+
+
+def _gate(rig):
+    rig.transcriber.gate = threading.Event()
+    rig.proofreader.gate = rig.transcriber.gate
+    return rig.transcriber.gate
+
+
+def _stalled(when):
+    """A hook that stalls the first call made on a matching thread until released."""
+    entered, release = threading.Event(), threading.Event()
+
+    def hook():
+        if when() and not entered.is_set():
+            entered.set()
+            release.wait(5)
+
+    return hook, entered, release
+
+
+def test_awake_while_recording_and_until_its_transcript_is_done(rig):
+    rig.controller.start()
+    rig.controller.toggle_recording()
+    assert rig.awake.held is True
+    rig.wait(lambda: rig.controller.recording_seconds() >= 0.05)
+    gate = _gate(rig)
+    rig.controller.toggle_recording()
+    assert rig.awake.history == [True]  # no gap while the recording is handed to transcription
+    gate.set()
+    rig.wait_idle()
+    assert rig.awake.history == [True, False]
+
+
+def test_awake_until_every_queued_file_is_done(rig):
+    gate = _gate(rig)
+    rig.controller.start()
+    rig.controller.add_files([rig.source("a.mp3"), rig.source("b.mp3")])
+    assert rig.awake.held is True
+    gate.set()
+    rig.wait_idle()
+    assert rig.awake.history == [True, False]
+
+
+def test_recording_during_a_job_keeps_one_hold(rig):
+    gate = _gate(rig)
+    rig.controller.start()
+    rig.controller.add_files([rig.source()])
+    rig.controller.toggle_recording()
+    rig.wait(lambda: rig.controller.recording_seconds() >= 0.05)
+    rig.controller.toggle_recording()
+    assert rig.awake.history == [True]
+    gate.set()
+    rig.wait_idle()
+    assert rig.awake.history == [True, False]
+
+
+def test_recording_that_never_starts_never_holds(tmp_path):
+    rig = Rig(tmp_path, capture_fails=True)
+    rig.controller.start()
+    rig.controller.toggle_recording()
+    assert rig.awake.history == []
+    rig.check_keep_awake_follows_busy()
+
+
+def test_recording_stopped_with_unwritable_job_records_lets_the_computer_sleep(rig):
+    rig.controller.start()
+    rig.controller.toggle_recording()
+    rig.wait(lambda: rig.controller.recording_seconds() >= 0.05)
+    _job_records_fail(rig, lambda job: job.stage is not Stage.RECORDING)
+    rig.controller.toggle_recording()
+    assert rig.awake.history == [True, False]
+
+
+@pytest.mark.parametrize("waiting_for", ["proofreading", "model"])
+def test_jobs_left_waiting_let_the_computer_sleep(rig, waiting_for):
+    if waiting_for == "proofreading":
+        rig.proofreader.blocked = "Ollama 没有启动"
+    else:
+        rig.transcriber.missing.add("large-v3")
+    rig.controller.start()
+    rig.controller.add_files([rig.source()])
+    rig.wait_idle()
+    assert rig.awake.history == [True, False]
+
+
+def test_paused_job_does_not_keep_the_computer_awake(rig):
+    _saved_job(rig, attempts=2)
+    rig.controller.start()
+    rig.wait(lambda: rig.controller.state.failed == 1)
+    assert rig.awake.history == []
+
+
+def _waiting_for_proofreading(rig):
+    rig.proofreader.blocked = "Ollama 没有启动"
+    rig.controller.add_files([rig.source()])
+    rig.wait_idle()
+    rig.proofreader.blocked = None
+
+
+def _failed_at_proofreading(rig):
+    rig.proofreader.error = RuntimeError("boom")
+    rig.controller.add_files([rig.source()])
+    rig.wait_idle()
+    rig.proofreader.error = None
+
+
+def _waiting_for_model(rig):
+    rig.transcriber.missing.add("large-v3")
+    rig.controller.add_files([rig.source()])
+    rig.wait_idle()
+
+
+_RESUMES = {
+    "retry_waiting": _waiting_for_proofreading,
+    "retry_failed": _failed_at_proofreading,
+    "download_needed_model": _waiting_for_model,
+}
+
+
+@pytest.mark.parametrize("action", sorted(_RESUMES))
+def test_awake_while_a_retried_or_resumed_job_runs(rig, action):
+    rig.controller.start()
+    _RESUMES[action](rig)
+    gate = _gate(rig)
+    getattr(rig.controller, action)()
+    rig.wait(lambda: rig.controller.state.pending == 1)
+    assert rig.awake.held is True
+    gate.set()
+    rig.wait_idle()
+    assert rig.awake.history[-2:] == [True, False]
+
+
+def test_quick_record_presses_never_leave_the_computer_held(rig):
+    rig.controller.start()
+    for _ in range(20):
+        rig.controller.toggle_recording()
+    rig.wait(lambda: not rig.controller.state.recording)
+    rig.wait_idle()
+    assert rig.awake.held is False
+
+
+def test_file_added_while_the_last_job_lets_go_keeps_the_computer_awake(rig):
+    """Forces the worker to be inside "let the computer sleep" while the window adds a file."""
+    hook, entered, release = _stalled(lambda: threading.current_thread().name == "jobs")
+    rig.awake.on_release = hook
+    rig.controller.start()
+    rig.controller.add_files([rig.source("a.mp3")])
+    assert entered.wait(5)
+    adder = threading.Thread(target=rig.controller.add_files, args=([rig.source("b.mp3")],))
+    adder.start()
+    time.sleep(0.1)
+    release.set()
+    adder.join(5)
+    rig.wait_idle()
+    assert rig.awake.history == [True, False, True, False]
+
+
+def test_failed_hold_keeps_working_logs_and_says_so_once(rig, caplog):
+    import logging
+
+    rig.awake.fail_hold = OSError("power request refused")
+    rig.controller.start()
+    with caplog.at_level(logging.WARNING):
+        rig.controller.toggle_recording()
+        rig.wait(lambda: rig.controller.recording_seconds() >= 0.05)
+        rig.controller.toggle_recording()
+        rig.wait_idle()
+        rig.controller.add_files([rig.source()])
+        rig.wait_idle()
+    assert [job.stage for job in rig.store.load_all()] == [Stage.DONE, Stage.DONE]
+    first_recording = next(state for state in rig.states if state.recording)
+    assert first_recording.notice == SLEEP_WARNING
+    shown = [SLEEP_WARNING in state.notice for state in rig.states]
+    assert sum(1 for before, now in zip([False] + shown, shown) if now and not before) == 1
+    assert caplog.text.count("power request refused") == 2  # one line per attempt, one attempt per busy period
+    assert rig.awake.hold_attempts == 2
+    assert rig.awake.violations == []
+
+
+def _record_briefly(rig):
+    rig.controller.toggle_recording()
+    rig.wait(lambda: rig.controller.recording_seconds() >= 0.05)
+    rig.controller.toggle_recording()
+
+
+def _add_a_file(rig):
+    rig.controller.add_files([rig.source("b.mp3")])
+
+
+def _retry_a_failed_file(rig):
+    _saved_job(rig, stage=Stage.FAILED)
+    rig.controller.retry_failed()
+
+
+@pytest.mark.parametrize("second_busy", [_record_briefly, _add_a_file, _retry_a_failed_file])
+def test_hold_is_tried_again_the_next_time_there_is_work(rig, second_busy):
+    rig.awake.fail_hold = OSError("power request refused")
+    rig.controller.start()
+    rig.controller.add_files([rig.source("a.mp3")])
+    rig.wait_idle()
+    rig.awake.fail_hold = None
+    gate = _gate(rig)
+    since = len(rig.states)
+    second_busy(rig)
+    rig.wait(lambda: rig.controller.state.pending >= 1)
+    assert rig.awake.held is True
+    assert rig.awake.hold_attempts == 2
+    assert not any(SLEEP_WARNING in state.notice for state in rig.states[since:])
+    gate.set()
+    rig.wait_idle()
+
+
+def test_hold_failing_in_an_unexpected_way_still_lets_the_work_finish(rig):
+    rig.awake.fail_hold = AttributeError("function 'PowerCreateRequest' not found")
+    gate = _gate(rig)
+    rig.controller.start()
+    rig.controller.add_files([rig.source()])
+    assert SLEEP_WARNING in rig.controller.state.notice
+    gate.set()
+    rig.wait_idle()
+    assert rig.store.load_all()[0].stage is Stage.DONE
+    assert rig.awake.violations == []
+
+
+def test_failed_release_is_logged_not_shown_and_the_next_hold_works(rig, caplog):
+    import logging
+
+    rig.awake.fail_release = OSError("clear failed")
+    rig.controller.start()
+    with caplog.at_level(logging.WARNING):
+        rig.controller.add_files([rig.source()])
+        rig.wait_idle()
+    assert SLEEP_WARNING not in rig.controller.state.notice
+    assert "clear failed" in caplog.text
+    rig.awake.fail_release = None
+    rig.controller.toggle_recording()
+    assert rig.awake.held is True
+    rig.controller.toggle_recording()
+
+
+def _add_good_and_bad(rig):
+    rig.controller.add_files([rig.source("a.mp3"), rig.tmp_path / "x.docx"])
+
+
+def _retry_waiting_first(rig):
+    _saved_job(rig, stage=Stage.WAITING_PROOFREAD)
+    rig.controller.retry_waiting()
+
+
+@pytest.mark.parametrize("first_busy", [_add_good_and_bad, _retry_a_failed_file, _retry_waiting_first])
+def test_sleep_warning_is_not_wiped_by_the_notice_of_the_same_action(rig, first_busy):
+    rig.awake.fail_hold = OSError("power request refused")
+    gate = _gate(rig)
+    rig.controller.start()
+    first_busy(rig)
+    assert SLEEP_WARNING in rig.controller.state.notice
+    gate.set()
+    rig.wait_idle()
+
+
+@pytest.mark.parametrize("situation", ["jobs queued", "recording", "idle"])
+def test_closing_lets_the_computer_sleep(rig, situation):
+    rig.controller.start()
+    if situation == "jobs queued":
+        gate = _gate(rig)
+        rig.controller.add_files([rig.source("a.mp3"), rig.source("b.mp3")])
+    elif situation == "recording":
+        rig.controller.toggle_recording()
+    rig.controller.shutdown()
+    assert rig.awake.held is False
+    assert rig.awake.history == ([] if situation == "idle" else [True, False])
+    if situation == "jobs queued":
+        gate.set()
+
+
+def test_nothing_holds_after_closing_and_closing_twice_is_harmless(rig):
+    rig.controller.start()
+    rig.controller.shutdown()
+    rig.controller.add_files([rig.source()])
+    rig.controller.shutdown()
+    assert rig.awake.history == []
+
+
+def test_closing_while_a_hold_is_in_progress_ends_released(rig):
+    hook, entered, release = _stalled(lambda: threading.current_thread().name == "adder")
+    rig.awake.on_hold = hook
+    rig.controller.start()
+    adder = threading.Thread(target=rig.controller.add_files, args=([rig.source()],), name="adder")
+    adder.start()
+    assert entered.wait(5)
+    closer = threading.Thread(target=rig.controller.shutdown)
+    closer.start()
+    time.sleep(0.1)
+    release.set()
+    adder.join(5)
+    closer.join(5)
+    assert rig.awake.held is False
+    assert rig.awake.history[-1] is False
+
+
+def test_awake_while_jobs_left_by_the_last_run_continue(rig):
+    _saved_job(rig, attempts=1)
+    gate = _gate(rig)
+    rig.controller.start()
+    assert rig.awake.held is True
+    gate.set()
+    rig.wait_idle()
+    assert rig.awake.history == [True, False]
+
+
+def test_nothing_to_continue_means_no_hold_at_start(rig):
+    rig.controller.start()
+    assert rig.awake.history == []
+
+
+def test_sleep_warning_goes_away_when_the_work_is_over(rig):
+    """A notice carried forward, like a failed download, must not keep saying the computer may sleep."""
+    rig.awake.fail_hold = OSError("power request refused")
+    rig.transcriber.missing.add("large-v3")
+    rig.download_error = OSError("no internet")
+    rig.controller.start()
+    _saved_job(rig, stage=Stage.WAITING_MODEL)  # the download is the first work of this run
+    rig.controller.download_needed_model()
+    rig.wait(lambda: "下载失败" in rig.controller.state.notice)
+    rig.wait_idle()
+    assert "下载失败" in rig.controller.state.notice
+    assert SLEEP_WARNING not in rig.controller.state.notice
+
+
+def test_mac_keep_awake_can_be_used_and_never_fails():
+    from coursescribe.platform import macos
+
+    keep_awake = macos.create_keep_awake()
+    assert [keep_awake.hold(), keep_awake.hold(), keep_awake.release(), keep_awake.release()] == [None] * 4
 
 
 def test_unexpected_error_is_reported_in_plain_words(rig):
