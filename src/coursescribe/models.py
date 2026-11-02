@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 DEFAULT_TRANSCRIBE_MODEL = "large-v3"
-DEFAULT_PROOFREAD_MODEL = "qwen2.5:14b"
+DEFAULT_PROOFREAD_MODEL = "gemma4:12b"
 
 MODELS = {
     "large-v3": 3.1,

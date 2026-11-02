@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from coursescribe.models import DEFAULT_PROOFREAD_MODEL
 from coursescribe.ollama import OllamaClient, OllamaDown, OllamaError, OllamaTimeout
 from coursescribe.pipeline import ProofreadBlocked
 from coursescribe.proofread import (
@@ -142,6 +143,7 @@ class TestCleanCopyEdits:
             ("你可以观察到观察到的绝大多数人只是获取了信息", "你可以观察到的绝大多数人，只是获取了信息。"),
             ("然后他就像你的研究生一样派发出一堆的subagent", "然后它就像你的研究生一样，派发出一堆的 subagent。"),
             ("yeah然后我们继续讲", "然后我们继续讲。"),
+            ("你要用client你不要用这个GUI", "你要用CLI，你不要用这个GUI。"),  # a misheard English term
         ],
     )
     def test_accepts_dropped_tics_stutters_and_pronoun_fixes(self, original, corrected):
@@ -460,10 +462,11 @@ def test_real_ollama_proofreads_without_losing_content(tmp_path):
         installed = client.models()
     except OllamaDown:
         pytest.fail("Ollama is not running. Start Ollama, then run this test again.")
-    if "qwen2.5:14b" not in installed:
-        pytest.fail("Model qwen2.5:14b is missing. Run: ollama pull qwen2.5:14b")
-    result = OllamaProofreader(client).proofread(text, "qwen2.5:14b", tmp_path / "c.json", lambda d, t: None)
-    client.unload("qwen2.5:14b")
+    model = DEFAULT_PROOFREAD_MODEL
+    if model not in installed:
+        pytest.fail(f"Model {model} is missing. Run: ollama pull {model}")
+    result = OllamaProofreader(client).proofread(text, model, tmp_path / "c.json", lambda d, t: None)
+    client.unload(model)
     assert result.unproofread_chunks == 0
     assert "。" in result.markdown
     assert is_lossless(text, result.markdown)

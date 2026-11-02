@@ -58,7 +58,7 @@ def test_one_hour_lesson_finishes_without_losing_content(tmp_path):
     store = JobStore(tmp_path / "state")
     from datetime import datetime
 
-    job = Job.new_file(lesson, tmp_path / "out", datetime.now(), "large-v3", "qwen2.5:14b")
+    job = Job.new_file(lesson, tmp_path / "out", datetime.now(), "large-v3", "gemma4:12b")
     store.save(job)
     marks: dict[str, float] = {}
 

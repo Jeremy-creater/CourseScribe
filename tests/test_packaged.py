@@ -35,7 +35,7 @@ class Packaged:
         self.home = home
         self.out = home / "out"
         (home / "settings.json").write_text(
-            json.dumps({"output_dir": str(self.out), "transcribe_model": "large-v3", "proofread_model": "qwen2.5:14b"}),
+            json.dumps({"output_dir": str(self.out), "transcribe_model": "large-v3", "proofread_model": "gemma4:12b"}),
             encoding="utf-8",
         )
         self.store = JobStore(home / "jobs")
@@ -141,7 +141,7 @@ def _watch_connections(pid: int) -> set[str]:
 
 
 def test_file_job_finishes_on_the_gpu_with_only_bundled_libraries(packaged, spoken):
-    job = Job.new_file(spoken, packaged.out, datetime.now(), "large-v3", "qwen2.5:14b")
+    job = Job.new_file(spoken, packaged.out, datetime.now(), "large-v3", "gemma4:12b")
     packaged.store.save(job)
     packaged.start()
     remote_hosts = _watch_connections(packaged.process.pid)

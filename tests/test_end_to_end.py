@@ -35,7 +35,7 @@ def _controller(tmp_path):
     stopping = threading.Event()
     return AppController(
         store=JobStore(tmp_path / "state"),
-        settings=SettingsStore(tmp_path / "s.json", Settings(tmp_path / "out", "large-v3", "qwen2.5:14b")),
+        settings=SettingsStore(tmp_path / "s.json", Settings(tmp_path / "out", "large-v3", "gemma4:12b")),
         transcriber=WhisperTranscriber(should_stop=stopping.is_set),
         proofreader=OllamaProofreader(),
         open_capture=open_system_audio,

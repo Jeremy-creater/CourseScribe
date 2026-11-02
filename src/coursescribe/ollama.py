@@ -13,7 +13,8 @@ from urllib.parse import urlparse
 DEFAULT_URL = "http://127.0.0.1:11434"
 _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
-# qwen2.5:14b spills out of a 16 GB GPU onto the CPU above this context size.
+# Large enough for an 800-character chunk and its prompt; qwen2.5:14b spills out of a
+# 16 GB GPU onto the CPU above this size.
 _NUM_CTX = 6144
 
 

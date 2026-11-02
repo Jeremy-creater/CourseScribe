@@ -42,6 +42,7 @@ _FILLERS = frozenset("嗯呃啊呢哦额唉哎呀嘛哈")
 _TIC_WORDS = ("对不对", "对吧", "对啊", "是吧", "yeah", "这个", "那个", "然后")
 _MAX_LOST_RUN = 2  # characters: a longer gap is lost or invented text
 _MAX_STUTTER = 6  # a doubled run longer than this is a repeated passage, not a stutter
+_MAX_SPELLING_FIX = 4  # letters an English respelling may drop or add
 _MAX_REPLACED = 6
 _MAX_TERM_LENGTH = 12
 _MAX_CHANGED_RATIO = 0.05
@@ -95,6 +96,8 @@ def is_lossless(original: str, corrected: str) -> bool:
                 return False
         elif not new and len(old) <= _MAX_STUTTER and old * 2 in before:
             continue  # a stutter: the same words said twice in a row, kept once
+        elif (old + new).isascii() and len(old + new) <= _MAX_SPELLING_FIX:
+            changed += 1  # part of a misheard English word respelled, "client" -> "CLI"
         else:
             real = _without_tics("".join(ch for ch in old + new if ch not in _FILLERS))
             if len(real) > _MAX_LOST_RUN:

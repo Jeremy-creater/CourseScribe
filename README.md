@@ -9,7 +9,7 @@ Under development. Windows works today; Mac recording is planned next. Requireme
 You need Python 3.12 and [Ollama](https://ollama.com) with the proofreading model:
 
 ```text
-ollama pull qwen2.5:14b
+ollama pull gemma4:12b
 python -m pip install -e .[dev,gpu]
 python -m coursescribe
 ```
