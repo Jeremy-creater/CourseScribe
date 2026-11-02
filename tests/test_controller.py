@@ -133,7 +133,7 @@ def test_chosen_file_goes_all_the_way_with_no_other_action(rig):
     rig.wait_idle()
     folder = rig.tmp_path / "out" / "第一课"
     assert (folder / "第一课.txt").read_text(encoding="utf-8") == "第一课的内容\n"
-    assert (folder / "第一课.md").read_text(encoding="utf-8") == "第一课的内容。\n"
+    assert (folder / "第一课.md").read_text(encoding="utf-8") == "# 第一课\n\n第一课的内容。\n"
     assert rig.controller.state.last_folder == folder
     assert "完成" in rig.controller.state.notice
 

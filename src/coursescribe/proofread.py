@@ -23,7 +23,8 @@ from coursescribe.ollama import (
     OllamaModelMissing,
 )
 from coursescribe.pipeline import ProofreadBlocked, ProofreadResult
-from coursescribe.text import chunk_text, clean_fillers, content_chars, correct_terms, split_sentences
+from coursescribe.text import chunk_text, clean_fillers, clean_tics, content_chars, correct_terms, split_sentences
+from coursescribe.vocabulary import EMPTY, Vocabulary, apply_fixes
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +34,14 @@ BREAK_MARKER = "只返回句子编号"
 _CHUNK_CHARS = 800  # small enough to redo quickly, and well inside the model's context
 _ATTEMPTS = 2
 _MIN_PARAGRAPH_CHARS = 40
+_MAX_PARAGRAPH_CHARS = 350  # longer reads as a wall of text
 _BREAK_WINDOW_CHARS = 3000
 
-_FILLERS = frozenset("嗯呃啊呢哦额唉哎呀嘛")
+_FILLERS = frozenset("嗯呃啊呢哦额唉哎呀嘛哈")
+# Tics the clean copy may drop (PRD), as compared: letters and digits only, lower case.
+_TIC_WORDS = ("对不对", "对吧", "对啊", "是吧", "yeah", "这个", "那个", "然后")
 _MAX_LOST_RUN = 2  # characters: a longer gap is lost or invented text
+_MAX_STUTTER = 6  # a doubled run longer than this is a repeated passage, not a stutter
 _MAX_REPLACED = 6
 _MAX_TERM_LENGTH = 12
 _MAX_CHANGED_RATIO = 0.05
@@ -46,16 +51,20 @@ _SEARCH_WIDTH_RATIO = 0.1
 _FORMATTING = ("#", "*", "`", ">", "- ")
 
 _PROMPT = (
-    "你是中文转录稿校对员。下面是一段网课的语音转录文字，请只做三件事：\n"
+    "你是中文讲课转录稿的编辑。把下面的口语转录整理成可直接阅读的文字稿，要求：\n"
     "1. 按语义加标点（逗号、句号、问号等）并断句；\n"
-    "2. 只修正明显的错别字和同音识别错误，拿不准就保持原样；英文术语保持英文原文，不要翻译；\n"
-    "3. 逐字保留原文的每一句话和说话顺序，不得删除、增加、合并、改写或总结任何内容。\n"
+    "2. 修正错别字和同音识别错误，拿不准就保持原样；英文术语保持英文原文，不要翻译；\n"
+    "3. 删除口头禅和无意义的词：嗯、呃、啊、呢、哈、呀、对吧、对不对、对啊、yeah，"
+    "以及作停顿用的“这个”“那个”“然后呢”；口吃式的紧挨着重复只保留一遍；\n"
+    "4. 指代 AI、软件、工具、模型时用“它”，不用“他”；\n"
+    "5. 除以上几点，逐字保留原文的每一句话和说话顺序，不得总结、概括、改写、合并或增加任何内容。\n"
     "不要加标题、列表或任何格式。直接返回处理后的正文，不要任何说明或前缀。"
 )
-_RETRY_NOTE = "\n注意：上一次的结果漏掉或改动了原文内容。这一次必须一字不漏。"
+_TERMS_NOTE = "\n本课的常用词：{terms}。转录里读音相同或相近的错字，改成这些词。"
+_RETRY_NOTE = "\n注意：上一次的结果漏掉或改动了原文内容。这一次除口头禅外必须一字不漏。"
 _BREAK_PROMPT = (
     "下面是一段讲课转录稿，已经按句子编号，每行一句。请根据话题转换，判断应该在哪些句子之后分段。"
-    "每段应包含完整的一层意思，不要一两句话就分一段。\n"
+    "每段应包含完整的一层意思，通常 3 到 6 句、100 到 300 字，不要一两句话就分一段，也不要整页一段。\n"
     f"{BREAK_MARKER}，用逗号分隔，例如：3,8,15。不要返回任何正文或解释；如果不需要分段，返回“无”。\n\n"
 )
 
@@ -84,12 +93,23 @@ def is_lossless(original: str, corrected: str) -> bool:
                 changed += max(len(old), len(new))
             else:
                 return False
+        elif not new and len(old) <= _MAX_STUTTER and old * 2 in before:
+            continue  # a stutter: the same words said twice in a row, kept once
         else:
-            real = [ch for ch in old + new if ch not in _FILLERS]
+            real = _without_tics("".join(ch for ch in old + new if ch not in _FILLERS))
             if len(real) > _MAX_LOST_RUN:
                 return False
             changed += len(real)
     return changed <= limit
+
+
+def _without_tics(run: str) -> str:
+    previous = None
+    while previous != run:
+        previous = run
+        for word in _TIC_WORDS:
+            run = run.replace(word, "")
+    return run
 
 
 def _differences(before: str, after: str, width: int) -> list[tuple[str, str]] | None:
@@ -170,20 +190,46 @@ def parse_breaks(reply: str, sentence_count: int) -> list[int]:
     return sorted(found)
 
 
-def apply_breaks(sentences: list[str], breaks: Iterable[int], min_chars: int) -> str:
-    """Join sentences, with a blank line after each position that leaves both sides long enough."""
-    paragraphs: list[str] = []
+def apply_breaks(sentences: list[str], breaks: Iterable[int], min_chars: int, max_chars: int | None = None) -> str:
+    """Join sentences, with a blank line after each position that leaves both sides long enough.
+
+    A paragraph still longer than ``max_chars`` is split further at sentence ends.
+    """
+    groups: list[list[str]] = []
     start = 0
     for position in sorted(set(breaks)):
         paragraph = "".join(sentences[start:position]).strip()
         rest = "".join(sentences[position:]).strip()
         if len(paragraph) >= min_chars and len(rest) >= min_chars:
-            paragraphs.append(paragraph)
+            groups.append(sentences[start:position])
             start = position
-    last = "".join(sentences[start:]).strip()
-    if last:
-        paragraphs.append(last)
+    groups.append(sentences[start:])
+    paragraphs: list[str] = []
+    for group in groups:
+        for part in _split_long(group, max_chars) if max_chars else [group]:
+            text = "".join(part).strip()
+            if text:
+                paragraphs.append(text)
     return "\n\n".join(paragraphs)
+
+
+def _split_long(group: list[str], max_chars: int) -> list[list[str]]:
+    total = sum(len(s) for s in group)
+    if total <= max_chars:
+        return [group]
+    pieces = -(-total // max_chars)  # even sizes read better than one full piece and a stub
+    target = total / pieces
+    parts: list[list[str]] = []
+    current: list[str] = []
+    size = 0
+    for sentence in group:
+        if current and size + len(sentence) > target and len(parts) < pieces - 1:
+            parts.append(current)
+            current, size = [], 0
+        current.append(sentence)
+        size += len(sentence)
+    parts.append(current)
+    return parts
 
 
 def group_windows(sentences: list[str], limit: int) -> list[list[str]]:
@@ -215,9 +261,16 @@ def _join_lines(chunk: str) -> str:
 
 
 class OllamaProofreader:
-    def __init__(self, client: OllamaClient | None = None, chunk_chars: int = _CHUNK_CHARS) -> None:
+    def __init__(
+        self,
+        client: OllamaClient | None = None,
+        chunk_chars: int = _CHUNK_CHARS,
+        vocabulary: Callable[[], Vocabulary] = lambda: EMPTY,
+    ) -> None:
         self.client = client or OllamaClient()
         self.chunk_chars = chunk_chars
+        self._load_vocabulary = vocabulary
+        self._vocabulary = EMPTY
 
     def release(self, model: str) -> None:
         try:
@@ -244,7 +297,8 @@ class OllamaProofreader:
             raise OllamaModelMissing(model)
 
     def _run(self, text: str, model: str, checkpoint: Path, on_progress) -> ProofreadResult:
-        prepared = correct_terms(clean_fillers(text))
+        self._vocabulary = self._load_vocabulary()  # read for each task, so edits apply to the next one
+        prepared = self._tidy(text)
         chunks = [c for c in chunk_text(prepared, self.chunk_chars) if content_chars(c)]
         state = _load_state(checkpoint, _fingerprint(prepared, self.chunk_chars))
 
@@ -267,9 +321,17 @@ class OllamaProofreader:
         markdown = "\n\n".join(paragraphs)
         return ProofreadResult(f"{markdown}\n" if markdown else "", failed, len(chunks))
 
+    def _tidy(self, text: str) -> str:
+        """Everything done by rule: word-list fixes, tics, fillers, English term spelling."""
+        return correct_terms(clean_fillers(clean_tics(apply_fixes(text, self._vocabulary))))
+
+    def _prompt(self) -> str:
+        terms = self._vocabulary.all_terms()
+        return _PROMPT + (_TERMS_NOTE.format(terms="、".join(terms)) if terms else "")
+
     def _proofread_chunk(self, chunk: str, model: str) -> dict:
         for attempt in range(_ATTEMPTS):
-            prompt = _PROMPT + (_RETRY_NOTE if attempt else "") + TEXT_MARKER + chunk
+            prompt = self._prompt() + (_RETRY_NOTE if attempt else "") + TEXT_MARKER + chunk
             try:
                 reply = self.client.generate(model, prompt)
             except (OllamaDown, OllamaModelMissing):
@@ -278,7 +340,7 @@ class OllamaProofreader:
                 logger.warning("Proofreading attempt %d failed: %s", attempt + 1, exc)
                 continue
             if reply and is_lossless(chunk, reply):
-                return {"text": correct_terms(clean_fillers(_join_lines(reply))), "ok": True}
+                return {"text": self._tidy(_join_lines(reply)), "ok": True}
             logger.warning("Proofreading attempt %d changed the content; rejected", attempt + 1)
         return {"text": chunk, "ok": False}
 
@@ -311,7 +373,7 @@ class OllamaProofreader:
                 atomic_write_json(checkpoint, state)
             breaks.extend(offset + position for position in state["breaks"][key])
             offset += len(window)
-        return apply_breaks(sentences, breaks, _MIN_PARAGRAPH_CHARS)
+        return apply_breaks(sentences, breaks, _MIN_PARAGRAPH_CHARS, _MAX_PARAGRAPH_CHARS)
 
     def _window_breaks(self, window: list[str], model: str) -> list[int]:
         if len(window) < 2:

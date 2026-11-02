@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 from coursescribe.models import MODELS, model_size_label
 from coursescribe.settings import Settings
 from coursescribe.ui.style import set_role
+from coursescribe.vocabulary import ensure_word_list
 
 
 class SettingsDialog(QDialog):
@@ -29,12 +30,16 @@ class SettingsDialog(QDialog):
         proofread_models: Iterable[str],
         choose_folder: Callable[[], Path | None] | None = None,
         parent: QWidget | None = None,
+        word_list: Path | None = None,
+        open_file: Callable[[Path], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setMinimumWidth(620)
         self._folder = current.output_dir
         self._choose_folder = choose_folder or self._pick_folder
+        self._word_list = word_list
+        self._open_file = open_file
 
         self.transcribe_box = QComboBox()
         for name in MODELS:
@@ -58,6 +63,15 @@ class SettingsDialog(QDialog):
         folder_row.addWidget(self.folder_label, 1)
         folder_row.addWidget(self.folder_button)
 
+        self.word_list_button = QPushButton("打开词表…")
+        self.word_list_button.clicked.connect(self._open_word_list)
+        self.word_list_button.setEnabled(word_list is not None and open_file is not None)
+        word_note = QLabel("写常用词，或“听错 → 正确”，校对时自动替换")
+        word_note.setProperty("muted", True)
+        word_row = QHBoxLayout()
+        word_row.addWidget(word_note, 1)
+        word_row.addWidget(self.word_list_button)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("保存")
         set_role(buttons.button(QDialogButtonBox.Ok), "primary")
@@ -76,6 +90,7 @@ class SettingsDialog(QDialog):
         form.addRow("", self.size_label)
         form.addRow("校对模型", self.proofread_box)
         form.addRow("保存到", folder_row)
+        form.addRow("词表", word_row)
         form.addRow(note)
         form.addRow(buttons)
 
@@ -91,6 +106,12 @@ class SettingsDialog(QDialog):
         if chosen:
             self._folder = chosen
             self.folder_label.setText(str(chosen))
+
+    def _open_word_list(self) -> None:
+        if self._word_list is None or self._open_file is None:
+            return
+        ensure_word_list(self._word_list)
+        self._open_file(self._word_list)
 
     def result_settings(self) -> Settings:
         return Settings(self._folder, self.transcribe_box.currentText(), self.proofread_box.currentText().strip())

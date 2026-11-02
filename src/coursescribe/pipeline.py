@@ -159,7 +159,7 @@ class Pipeline:
             )
         finally:
             self.proofreader.release(job.proofread_model)
-        job.md_path = commit_new_text(job.md_path, result.markdown)
+        job.md_path = commit_new_text(job.md_path, f"# {job.md_path.stem}\n\n{result.markdown}")
         job.unproofread_chunks = result.unproofread_chunks
         job.total_chunks = result.total_chunks
         message = f"有 {result.unproofread_chunks} 段没校对，保留了原文。" if result.unproofread_chunks else ""

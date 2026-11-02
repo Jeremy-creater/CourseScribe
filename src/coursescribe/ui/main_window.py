@@ -46,6 +46,7 @@ class MainWindow(QWidget):
         confirm: Callable[[str], bool],
         open_folder: Callable[[Path], None],
         list_proofread_models: Callable[[], Iterable[str]],
+        word_list: Path | None = None,
     ) -> None:
         super().__init__()
         self.controller = controller
@@ -53,6 +54,7 @@ class MainWindow(QWidget):
         self._confirm = confirm
         self._open_folder = open_folder
         self._list_proofread_models = list_proofread_models
+        self._word_list = word_list
         self.setWindowTitle("CourseScribe")
         self.setObjectName("mainWindow")
         self.setAcceptDrops(True)
@@ -176,7 +178,13 @@ class MainWindow(QWidget):
             self.controller.add_files(chosen)
 
     def _open_settings(self) -> None:
-        dialog = SettingsDialog(self.controller.settings, self._list_proofread_models(), parent=self)
+        dialog = SettingsDialog(
+            self.controller.settings,
+            self._list_proofread_models(),
+            parent=self,
+            word_list=self._word_list,
+            open_file=self._open_folder,  # the system opens a file the same way as a folder
+        )
         if dialog.exec():
             self.controller.update_settings(dialog.result_settings())
         dialog.deleteLater()  # destroyed here, never by garbage collection on a worker thread

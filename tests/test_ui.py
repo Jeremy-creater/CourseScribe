@@ -257,7 +257,7 @@ def test_settings_button_saves_through_the_dialog(screen, tmp_path, monkeypatch)
     from coursescribe.ui import main_window
 
     class Stub:
-        def __init__(self, current, models, parent=None):
+        def __init__(self, current, models, parent=None, **links):
             assert models == ["model-a", "model-b"]
             self.current = current
 
@@ -328,3 +328,29 @@ class TestLook:
         dialog.show()
         save = dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok)
         assert _middle_colour(save) == COLORS["accent"]
+
+
+class TestWordList:
+    def test_button_creates_the_word_list_and_opens_it(self, tmp_path, qt_app):
+        from coursescribe.vocabulary import TEMPLATE
+
+        opened = []
+        path = tmp_path / "home" / "词表.txt"
+        dialog = SettingsDialog(
+            Settings(tmp_path, "large-v3", "model-a"), ["model-a"], choose_folder=lambda: None,
+            word_list=path, open_file=opened.append,
+        )
+        dialog.word_list_button.click()
+        assert opened == [path]
+        assert path.read_text(encoding="utf-8") == TEMPLATE
+
+    def test_an_existing_word_list_is_opened_untouched(self, tmp_path, qt_app):
+        opened = []
+        path = tmp_path / "词表.txt"
+        path.write_text("践行\n", encoding="utf-8")
+        dialog = SettingsDialog(
+            Settings(tmp_path, "large-v3", "model-a"), ["model-a"], choose_folder=lambda: None,
+            word_list=path, open_file=opened.append,
+        )
+        dialog.word_list_button.click()
+        assert opened == [path] and path.read_text(encoding="utf-8") == "践行\n"

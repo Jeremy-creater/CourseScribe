@@ -21,6 +21,7 @@ from coursescribe.proofread import (
     parse_breaks,
 )
 from coursescribe.text import content_chars
+from coursescribe.vocabulary import parse_vocabulary
 from fake_ollama import FakeOllama, Reply
 
 SOURCE = "今天我们讲数据库索引\n索引可以让查询变快\n但是写入会变慢一点\n"
@@ -130,6 +131,34 @@ class TestIsLossless:
         assert is_lossless("", "")
 
 
+class TestCleanCopyEdits:
+    """The clean copy may drop tics and stutters, nothing else (PRD)."""
+
+    @pytest.mark.parametrize(
+        ("original", "corrected"),
+        [
+            ("因为你过去也是要学编程的对不对那么现在来看", "因为你过去也是要学编程的。那么现在来看，"),
+            ("然后呢这个这个编程领域只能算是一个子集", "编程领域只能算是一个子集。"),
+            ("你可以观察到观察到的绝大多数人只是获取了信息", "你可以观察到的绝大多数人，只是获取了信息。"),
+            ("然后他就像你的研究生一样派发出一堆的subagent", "然后它就像你的研究生一样，派发出一堆的 subagent。"),
+            ("yeah然后我们继续讲", "然后我们继续讲。"),
+        ],
+    )
+    def test_accepts_dropped_tics_stutters_and_pronoun_fixes(self, original, corrected):
+        assert is_lossless(original, corrected)
+
+    @pytest.mark.parametrize(
+        "corrected",
+        [
+            "所以今天我们用AI去辅助学习。就是信息获取了之后消化的能力没有变。",  # a sentence lost
+            "所以今天我们用AI去辅助学习，然而有一件事情变了。",  # meaning reversed
+        ],
+    )
+    def test_still_rejects_lost_or_changed_meaning(self, corrected):
+        original = "所以今天我们用AI去辅助学习然而有一件事情没有变就是信息获取了之后消化的能力没有变"
+        assert not is_lossless(original, corrected)
+
+
 class TestParseBreaks:
     @pytest.mark.parametrize(
         ("reply", "count", "expected"),
@@ -161,6 +190,17 @@ class TestApplyBreaks:
 
     def test_no_sentences(self):
         assert apply_breaks([], [1], min_chars=40) == ""
+
+    def test_a_paragraph_too_long_to_read_is_split_at_sentence_ends(self):
+        sentences = ["甲" * 60 + "。"] * 10
+        result = apply_breaks(sentences, [], min_chars=40, max_chars=300)
+        paragraphs = result.split("\n\n")
+        assert len(paragraphs) > 1
+        assert all(len(p) <= 300 for p in paragraphs)
+        assert "".join(paragraphs) == "".join(sentences)
+
+    def test_one_very_long_sentence_stays_whole(self):
+        assert apply_breaks(["甲" * 500 + "。"], [], min_chars=40, max_chars=300) == "甲" * 500 + "。"
 
 
 def test_windows_hold_whole_sentences_up_to_the_limit():
@@ -358,6 +398,48 @@ class TestProofread:
         )
         assert seen[-1] == (result.total_chunks, result.total_chunks)
         assert [d for d, _ in seen] == list(range(1, result.total_chunks + 1))
+
+    def test_tics_and_word_list_fixes_are_applied_before_the_model_sees_the_text(self, service, tmp_path):
+        fake = service()
+        vocabulary = parse_vocabulary("见行 → 践行\n")
+        _proofreader(fake, vocabulary=lambda: vocabulary).proofread(
+            "我们讲见行\n对不对\n这很重要\n", "model-a", tmp_path / "c.json", lambda d, t: None
+        )
+        chunk = chunk_of(fake.prompts[0])
+        assert "践行" in chunk and "见行" not in chunk and "对不对" not in chunk
+
+    def test_common_words_are_given_to_the_model(self, service, tmp_path):
+        fake = service()
+        vocabulary = parse_vocabulary("定投\n见行 → 践行\n")
+        _proofreader(fake, vocabulary=lambda: vocabulary).proofread(SOURCE, "model-a", tmp_path / "c.json", lambda d, t: None)
+        polish = next(p for p in fake.prompts if BREAK_MARKER not in p)
+        assert "定投" in polish.split(TEXT_MARKER)[0] and "践行" in polish.split(TEXT_MARKER)[0]
+
+    def test_no_word_list_means_no_word_hint(self, service, tmp_path):
+        fake = service()
+        _proofreader(fake).proofread(SOURCE, "model-a", tmp_path / "c.json", lambda d, t: None)
+        assert "常用词" not in fake.prompts[0]
+
+    def test_a_fix_the_model_undoes_is_applied_again(self, service, tmp_path):
+        fake = service(lambda p: "无" if BREAK_MARKER in p else "我们讲见行，这很重要。")
+        vocabulary = parse_vocabulary("见行 → 践行\n")
+        result = _proofreader(fake, vocabulary=lambda: vocabulary).proofread(
+            "我们讲见行\n这很重要\n", "model-a", tmp_path / "c.json", lambda d, t: None
+        )
+        assert "践行" in result.markdown and "见行" not in result.markdown
+
+    def test_a_chunk_the_model_fails_still_loses_its_tics(self, service, tmp_path):
+        fake = service(lambda p: "完全不同的一段话。" if BREAK_MARKER not in p and "第一段" in chunk_of(p) else echo_with_stop(p))
+        text = "第一段内容在这里\n对吧\n" + "甲" * 400 + "\n"
+        result = _proofreader(fake, chunk_chars=300).proofread(text, "model-a", tmp_path / "c.json", lambda d, t: None)
+        assert result.unproofread_chunks >= 1
+        assert "对吧" not in result.markdown and "第一段内容在这里" in result.markdown
+
+    def test_prompt_asks_for_a_clean_copy(self, service, tmp_path):
+        fake = service()
+        _proofreader(fake).proofread(SOURCE, "model-a", tmp_path / "c.json", lambda d, t: None)
+        polish = next(p for p in fake.prompts if BREAK_MARKER not in p)
+        assert "口头禅" in polish and "它" in polish and "总结" in polish
 
     def test_prompt_requires_verbatim_text_and_english_terms(self, service, tmp_path):
         fake = service()

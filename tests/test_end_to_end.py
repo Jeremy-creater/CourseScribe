@@ -62,6 +62,8 @@ def test_local_file_becomes_txt_and_proofread_md(tmp_path):
     proofread = job.md_path.read_text(encoding="utf-8")
     assert job.unproofread_chunks == 0
     assert any(mark in proofread for mark in "。，")
-    assert is_lossless(clean_fillers(raw), proofread)
-    assert "索引" in proofread and "#" not in proofread
+    heading, body = proofread.split("\n\n", 1)
+    assert heading == f"# {job.md_path.stem}"
+    assert is_lossless(clean_fillers(raw), body)
+    assert "索引" in body and "#" not in body
     print("\nTXT:", raw, "\nMD:", proofread)

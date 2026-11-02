@@ -109,7 +109,7 @@ def test_full_run_writes_both_files_and_finishes(tmp_path):
     _pipeline(store).run(job)
     assert job.stage is Stage.DONE
     assert job.txt_path.read_text(encoding="utf-8") == RAW
-    assert job.md_path.read_text(encoding="utf-8") == "校对后的正文。\n"
+    assert job.md_path.read_text(encoding="utf-8") == "# 课\n\n校对后的正文。\n"
     assert store.load_all()[0].stage is Stage.DONE
 
 
@@ -184,7 +184,7 @@ def test_power_cut_after_any_state_save_still_ends_with_correct_files(tmp_path, 
     final = plain.load_all()[0]
     assert final.stage is Stage.DONE
     assert final.txt_path.read_text(encoding="utf-8") == RAW
-    assert final.md_path.read_text(encoding="utf-8") == "校对后的正文。\n"
+    assert final.md_path.read_text(encoding="utf-8") == "# 课\n\n校对后的正文。\n"
     assert sorted(p.name for p in final.folder.iterdir()) == ["课.md", "课.txt"]
 
 

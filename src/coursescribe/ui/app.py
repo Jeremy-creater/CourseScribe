@@ -26,6 +26,8 @@ from coursescribe.settings import SettingsStore, app_home, default_settings
 from coursescribe.transcribe import WhisperTranscriber, download_whisper_model
 from coursescribe.ui.main_window import MainWindow
 from coursescribe.ui.style import apply_style
+from coursescribe.vocabulary import FILE_NAME as WORD_LIST_FILE
+from coursescribe.vocabulary import load_vocabulary
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +71,12 @@ def run() -> int:
         return 0
 
     stopping = threading.Event()
+    word_list = home / WORD_LIST_FILE
     controller = AppController(
         store=JobStore(home / "jobs"),
         settings=SettingsStore(home / "settings.json", default_settings()),
         transcriber=WhisperTranscriber(should_stop=stopping.is_set),
-        proofreader=OllamaProofreader(),
+        proofreader=OllamaProofreader(vocabulary=lambda: load_vocabulary(word_list)),
         open_capture=open_system_audio,
         download_model=download_whisper_model,
         stopping=stopping,
@@ -91,6 +94,7 @@ def run() -> int:
         confirm=confirm,
         open_folder=lambda folder: QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))),
         list_proofread_models=_list_proofread_models,
+        word_list=word_list,
     )
     hotkey = create_global_hotkey(window.hotkey_pressed.emit)
     if not hotkey.start():
