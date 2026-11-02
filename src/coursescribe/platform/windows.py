@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import sys
 import threading
@@ -14,6 +15,8 @@ import numpy as np
 
 # A program holding a file open can shut everyone else out for a moment (antivirus, indexer).
 FILES_CAN_BE_HELD = True
+
+logger = logging.getLogger(__name__)
 
 _SAMPLE_RATE = 48000
 _CHANNELS = 2
@@ -60,9 +63,12 @@ class WindowsSystemAudio:
         _start_com_for_this_thread()
         count = int(_SAMPLE_RATE * _KEEPER_BLOCK_SECONDS)
         block = np.zeros((count, _CHANNELS), dtype=np.float32)
-        with speaker.player(samplerate=_SAMPLE_RATE, channels=_CHANNELS) as player:
-            while not self._stop_keeper.is_set():
-                player.play(block)
+        try:
+            with speaker.player(samplerate=_SAMPLE_RATE, channels=_CHANNELS) as player:
+                while not self._stop_keeper.is_set():
+                    player.play(block)
+        except Exception:  # the device went away; the recording side notices and reconnects
+            logger.warning("The silent stream stopped", exc_info=True)
 
     def __exit__(self, *args) -> None:
         self._stop_keeper.set()

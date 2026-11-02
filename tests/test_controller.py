@@ -423,6 +423,20 @@ def test_recording_that_stopped_by_itself_is_never_shown_as_idle_before_it_is_qu
     assert "磁盘" in stopped.notice  # the reason is already there when the button changes back
 
 
+def test_recording_file_that_could_not_be_finished_is_kept_for_repair(rig, monkeypatch):
+    from coursescribe import wavfile
+
+    def close(self):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(wavfile.WavWriter, "close", close)
+    rig.controller.start()
+    rig.controller.toggle_recording()
+    rig.wait(lambda: rig.controller.recording_seconds() >= 0.25)
+    rig.controller.shutdown()
+    assert rig.store.load_all()[0].stage is Stage.RECORDING  # repaired before transcribing at the next start
+
+
 def test_stop_ends_the_recording_even_if_the_file_cannot_be_finished(rig, monkeypatch):
     from coursescribe import wavfile
 
@@ -436,7 +450,13 @@ def test_stop_ends_the_recording_even_if_the_file_cannot_be_finished(rig, monkey
     rig.controller.toggle_recording()
     assert rig.controller.state.recording is False
     rig.wait_idle()
-    assert rig.store.load_all()[0].stage is Stage.DONE
+    job = rig.store.load_all()[0]
+    assert job.stage is Stage.DONE
+    import wave
+
+    with wave.open(str(job.audio_path), "rb") as stream:
+        frames = stream.getnframes()
+    assert frames > 0 and frames * 4 == job.audio_path.stat().st_size - 44  # header repaired, nothing lost
 
 
 def _saved_job(rig, attempts=0, stage=Stage.TRANSCRIBING):
@@ -701,6 +721,84 @@ def test_pending_count_survives_a_file_added_while_another_job_finishes(rig):
     rig.wait(lambda: rig.controller.state.notice.startswith("完成：c"))
     assert rig.controller.state.pending == 0
     assert all(state.pending >= 0 for state in rig.states)
+
+
+def test_quitting_is_not_counted_as_a_crash_even_if_shutdown_is_cut_short(rig):
+    """Closing waits for the job thread; the user or Windows may end the program meanwhile."""
+    rig.transcriber.gate = threading.Event()
+    rig.controller.start()
+    rig.controller.add_files([rig.source()])
+    rig.wait(lambda: rig.store.load_all()[0].attempts == 1)  # the evidence a crash would leave
+    closer = threading.Thread(target=rig.controller.shutdown)
+    closer.start()
+    try:
+        rig.wait(lambda: (rig.store.folder / "closed-cleanly").exists(), seconds=1.0)
+    finally:
+        rig.transcriber.gate.set()
+        closer.join(5)
+
+
+def test_closing_still_saves_the_recording_when_the_clean_close_note_cannot_be_written(rig):
+    def full_disk():
+        raise OSError(28, "No space left on device")
+
+    rig.controller.start()
+    rig.controller.toggle_recording()
+    rig.wait(lambda: rig.controller.recording_seconds() >= 0.25)
+    rig.store.mark_closed_cleanly = full_disk
+    rig.controller.shutdown()
+    assert rig.store.load_all()[0].stage is Stage.TRANSCRIBING
+    assert rig.controller.state.recording is False
+
+
+def test_retried_paused_job_starts_a_fresh_crash_count(rig):
+    _saved_job(rig, attempts=2)
+    rig.controller.start()
+    rig.wait(lambda: rig.controller.state.failed == 1)
+    rig.transcriber.gate = threading.Event()
+    rig.controller.retry_failed()
+    try:
+        rig.wait(lambda: rig.store.load_all()[0].attempts == 1)  # not 3: one more crash must not pause it
+    finally:
+        rig.transcriber.gate.set()
+    rig.wait_idle()
+
+
+def test_retry_pressed_while_that_job_is_still_finishing_is_not_lost(rig):
+    entered, release = threading.Event(), threading.Event()
+    real_unfinished = rig.store.unfinished
+
+    def unfinished():
+        if threading.current_thread().name == "jobs" and not release.is_set():
+            entered.set()
+            release.wait(5)
+        return real_unfinished()
+
+    rig.store.unfinished = unfinished
+    rig.proofreader.error = RuntimeError("boom")
+    rig.controller.start()
+    rig.controller.add_files([rig.source()])
+    assert entered.wait(5)  # saved as failed, not yet handed back
+    rig.controller.retry_failed()
+    release.set()
+    rig.wait_idle()
+    assert rig.store.load_all()[0].stage is Stage.FAILED  # still failed and offered, never stranded
+    assert rig.controller.state.failed == 1
+
+
+@pytest.mark.parametrize(
+    ("action", "stage"),
+    [("retry_failed", Stage.FAILED), ("dismiss_failed", Stage.FAILED), ("retry_waiting", Stage.WAITING_PROOFREAD)],
+)
+def test_retry_and_ignore_with_unwritable_job_records_say_why(rig, action, stage):
+    rig.controller.start()
+    _saved_job(rig, stage=stage)
+    _job_records_fail(rig, lambda job: True)
+    getattr(rig.controller, action)()
+    assert "程序自己的数据文件夹" in rig.controller.state.notice
+    assert rig.store.load_all()[0].stage is stage
+    assert rig.controller.state.failed == (1 if stage is Stage.FAILED else 0)  # still offered
+    assert rig.controller.state.pending == 0
 
 
 def test_unexpected_error_is_reported_in_plain_words(rig):

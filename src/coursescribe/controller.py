@@ -118,11 +118,14 @@ class AppController:
 
     def shutdown(self) -> None:
         self._stopping.set()  # first, so the stopped recording is kept for next time, not started
+        try:
+            self.store.mark_closed_cleanly()  # before the waiting below, which Windows may cut short
+        except OSError as exc:
+            logger.warning("Could not note the clean close: %s", exc)
         self._stop_recording()
         self._queue.put(None)
         if self._worker.is_alive():
             self._worker.join(2.0)
-        self.store.mark_closed_cleanly()
 
     def _enqueue(self, job: Job, **changes) -> None:
         """Queue a job. Other changes are published together with it, so no state in between is ever shown."""
@@ -326,7 +329,8 @@ class AppController:
             self._save_running(job)
             self._publish(notice=job.message, **stopped)
             return
-        job.stage = Stage.TRANSCRIBING
+        # a file that could not be closed properly stays a recording, so it is repaired first
+        job.stage = Stage.TRANSCRIBING if session.finished else Stage.RECORDING
         if not self._save_running(job):
             # the record still says "recording", so the next start repairs and transcribes it
             self._publish(notice=f"录音已停止。{self._data_problem()}下次打开程序时会接着转录。", **stopped)
@@ -358,28 +362,42 @@ class AppController:
 
     def retry_waiting(self) -> None:
         """Try again the jobs waiting for proofreading, with the model set now."""
-        for job in self.store.unfinished():
-            if job.stage is Stage.WAITING_PROOFREAD:
-                job.proofread_model = self.settings.proofread_model
-                self.store.save(job)
-                self._enqueue(job)
-        self._publish(notice="")
+        waiting = [job for job in self.store.unfinished() if job.stage is Stage.WAITING_PROOFREAD]
+        self._change_jobs(waiting, self._retry_proofreading, queue=True)
 
     def retry_failed(self) -> None:
         """Run the failed jobs again from the step where each one stopped."""
-        for job in self.store.failed_to_offer():
-            job.stage = job.retry_stage()
-            job.message = ""
-            job.attempts = 0
-            self.store.save(job)
-            self._enqueue(job)
-        self._publish(notice="", **self._waiting_counts())
+        self._change_jobs(self.store.failed_to_offer(), self._retry_from_failed_step, queue=True)
 
     def dismiss_failed(self) -> None:
-        for job in self.store.failed_to_offer():
-            job.dismissed = True
-            self.store.save(job)
-        self._publish(notice="", **self._waiting_counts())
+        self._change_jobs(self.store.failed_to_offer(), self._dismiss, queue=False)
+
+    def _retry_proofreading(self, job: Job) -> None:
+        job.proofread_model = self.settings.proofread_model
+
+    @staticmethod
+    def _retry_from_failed_step(job: Job) -> None:
+        job.stage = job.retry_stage()
+        job.message = ""
+        job.attempts = 0
+
+    @staticmethod
+    def _dismiss(job: Job) -> None:
+        job.dismissed = True
+
+    def _change_jobs(self, jobs: list[Job], change: Callable[[Job], None], queue: bool) -> None:
+        not_saved = []
+        for job in jobs:
+            with self._lock:
+                if job.job_id in self._queued_ids:
+                    continue  # the worker still has it and will save its own copy
+            change(job)
+            if not self._save_running(job):
+                not_saved.append(job.folder.name)
+            elif queue:
+                self._enqueue(job)
+        notice = "没有处理：" + "、".join(not_saved) + "。" + self._data_problem() if not_saved else ""
+        self._publish(notice=notice, **self._waiting_counts())
 
     def download_needed_model(self) -> None:
         """The user has agreed to the download; waiting jobs continue after it."""

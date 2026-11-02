@@ -217,6 +217,7 @@ class TestRecordingSession:
         assert seconds == pytest.approx(len(data) / 2 / RATE)
         assert seconds >= 1.0
         assert capture.exited.is_set()
+        assert session.finished is True
 
     def test_device_that_will_not_open_fails_at_start_with_plain_words(self, tmp_path):
         def broken():
@@ -271,6 +272,37 @@ class TestRecordingSession:
         session.start()
         assert _wait_for(lambda: bool(ended))
         assert session.stop() == pytest.approx(1.0)
+        assert "转" in ended[0]
+        assert other.exited.is_set()  # the device opened in the wrong format is let go
+
+    def test_stop_while_reconnecting_ends_quietly(self, tmp_path):
+        """Stop can arrive while the device is reopening, which can take a while."""
+        opening, reopening, release = threading.Event(), threading.Event(), threading.Event()
+        second = FakeCapture()
+
+        def open_capture():
+            if not opening.is_set():
+                opening.set()
+                return FakeCapture(fail_after=4)
+            reopening.set()
+            release.wait(5)
+            return second
+
+        notices, ended = [], []
+        session = RecordingSession(open_capture, tmp_path / "a.wav", on_error=notices.append,
+                                   on_ended=ended.append, reconnect_wait=0.01)
+        session.start()
+        assert reopening.wait(5)
+        stopper = threading.Thread(target=session.stop)
+        stopper.start()
+        assert _wait_for(lambda: session._stop.is_set())
+        release.set()
+        stopper.join(5)
+        assert not stopper.is_alive()
+        assert notices == [] and ended == []  # no "reconnected, still recording" after Stop
+        assert second.exited.is_set()  # the device reopened meanwhile is let go
+        _, _, data = _read(tmp_path / "a.wav")
+        assert len(data) == RATE * 2
 
     def test_disk_error_ends_the_recording_and_stop_never_raises(self, tmp_path, monkeypatch):
         from coursescribe import wavfile
@@ -296,6 +328,10 @@ class TestRecordingSession:
         assert "磁盘" in ended[0]
         assert session.stop() == pytest.approx(1.0)
         assert session.stop() == pytest.approx(1.0)
+        assert session.finished is False  # the header may be behind: repair before use
+        assert repair_wav(tmp_path / "a.wav") == pytest.approx(1.0)
+        _, _, data = _read(tmp_path / "a.wav")
+        assert len(data) == RATE * 2  # what was recorded before the disk failed is all there
 
     def test_recording_stops_itself_at_the_file_size_limit(self, tmp_path):
         ended = []

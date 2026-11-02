@@ -104,11 +104,17 @@ class RecordingSession:
         self._writer: WavWriter | None = None
         self._write_lock = threading.Lock()
         self._seconds = 0.0
+        self._finished = True
 
     @property
     def seconds(self) -> float:
         with self._write_lock:
             return self._writer.seconds if self._writer else self._seconds
+
+    @property
+    def finished(self) -> bool:
+        """False when the file could not be closed properly: repair its header before use."""
+        return self._finished
 
     def start(self) -> None:
         self._thread.start()
@@ -150,6 +156,9 @@ class RecordingSession:
                 if capture is None:
                     if not self._stop.is_set():
                         self._on_ended(_ENDED_DEVICE)
+                    return
+                if self._stop.is_set():  # Stop came while the device was reopening
+                    _close_quietly(capture)
                     return
                 self._on_error(_RECONNECTED)
                 continue
@@ -208,7 +217,8 @@ class RecordingSession:
                 try:
                     self._writer.close()
                 except Exception:
-                    logger.exception("Could not finish the recording file; repairing it on the next start")
+                    logger.exception("Could not finish the recording file; it is repaired before use")
+                    self._finished = False
                 self._writer = None
         return self._seconds
 
