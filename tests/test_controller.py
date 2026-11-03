@@ -27,12 +27,13 @@ from coursescribe.pipeline import (
     ProofreadBlocked,
     ProofreadResult,
 )
+from coursescribe.recorder import _SWITCH_FAILED, _SWITCHED
 from coursescribe.segments import Segment
 from coursescribe.settings import Settings, SettingsStore
 from coursescribe.transcribe import WhisperTranscriber
 from coursescribe.wavfile import repair_wav
 from test_pipeline import RAW
-from test_recording import _crashed_wav, _disk_full_during_repair, _held
+from test_recording import FakeSoundSystem, _crashed_wav, _disk_full_during_repair, _held, _runs
 from test_transcribe import Engines, five_seconds
 
 NOW = datetime(2026, 11, 1, 19, 30)
@@ -90,6 +91,14 @@ class FakeProofreader:
 class FakeCapture:
     sample_rate = 48000
     channels = 2
+    device_name = "假设备"
+    device_id = "fake"
+
+    def is_default(self):
+        return True
+
+    def default_id(self):
+        return "fake"
 
     def __init__(self, fail=False):
         self.fail = fail
@@ -146,7 +155,7 @@ class FakeKeepAwake:
 
 
 class Rig:
-    def __init__(self, tmp_path: Path, capture_fails=False, transcriber=None, proofreader=None):
+    def __init__(self, tmp_path: Path, capture_fails=False, transcriber=None, proofreader=None, open_capture=None):
         self.tmp_path = tmp_path
         self.store = JobStore(tmp_path / "state")
         self.settings = SettingsStore(tmp_path / "settings.json", Settings(tmp_path / "out", "large-v3", "model-a"))
@@ -161,7 +170,7 @@ class Rig:
             settings=self.settings,
             transcriber=self.transcriber,
             proofreader=self.proofreader,
-            open_capture=lambda: FakeCapture(capture_fails),
+            open_capture=open_capture or (lambda: FakeCapture(capture_fails)),
             download_model=self._download,
             stopping=threading.Event(),
             keep_awake=self.awake,
@@ -1754,3 +1763,42 @@ def test_an_unreadable_word_list_fails_for_retry_says_the_same_each_time_and_fin
         again.check_keep_awake_follows_busy()
     finally:
         fake.close()
+
+
+def _record_through_a_device_change(tmp_path, system, expected_notice):
+    """Start recording on A, make B the default, wait for ``expected_notice``, then stop."""
+    rig = Rig(tmp_path, open_capture=system.open)
+    rig.controller.start()
+    rig.controller.toggle_recording()
+    try:
+        rig.wait(lambda: rig.controller.recording_seconds() >= 0.5)
+        system.default = "B"
+        rig.wait(lambda: rig.controller.state.notice == expected_notice)
+        assert rig.controller.state.recording is True
+    finally:
+        while_recording = list(rig.states)
+        rig.controller.toggle_recording()  # also when failing: a recording left running disturbs later tests
+    rig.wait_idle()
+    first = next(i for i, state in enumerate(while_recording) if state.recording)
+    assert all(state.recording for state in while_recording[first:])  # never stopped by the change
+    job = rig.store.load_all()[0]
+    assert job.stage is Stage.DONE
+    suffixes = sorted(path.suffix for path in job.folder.iterdir())
+    assert suffixes == [".md", ".txt", ".wav"]
+    return rig, job
+
+
+def test_recording_follows_a_new_default_output_into_the_same_file(tmp_path):
+    system = FakeSoundSystem(names={"A": "扬声器", "B": "耳机"}, read_sleep=0.002)
+    rig, job = _record_through_a_device_change(tmp_path, system, _SWITCHED.format(name="耳机"))
+    assert 2000 in [value for value, _ in _runs(job.audio_path)]
+    rig.check_keep_awake_follows_busy()
+
+
+def test_recording_that_cannot_follow_says_so_and_still_stops_and_transcribes(tmp_path):
+    system = FakeSoundSystem(
+        names={"A": "扬声器", "B": "耳机"}, refuse={"B": RuntimeError("Error 0x8889000a")}, read_sleep=0.002
+    )
+    rig, job = _record_through_a_device_change(tmp_path, system, _SWITCH_FAILED)
+    assert 2000 not in [value for value, _ in _runs(job.audio_path)]
+    rig.check_keep_awake_follows_busy()

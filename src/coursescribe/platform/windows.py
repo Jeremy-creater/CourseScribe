@@ -35,6 +35,9 @@ class WindowsSystemAudio:
     Windows may deliver nothing while no program is playing, which would freeze the
     recording during a pause. A silent stream keeps sound flowing, so pauses stay
     in the recording and stopping never waits on a device with nothing to say.
+
+    Windows converts whatever the device's own format is to the 48 kHz stereo asked for,
+    so a recording that moves to another device keeps the same format.
     """
 
     sample_rate = _SAMPLE_RATE
@@ -43,15 +46,24 @@ class WindowsSystemAudio:
     def __init__(self, speaker_name: str | None = None, keep_alive: bool = True) -> None:
         self._speaker_name = speaker_name
         self._keep_alive = keep_alive
+        self._speaker = None
         self._recorder = None
         self._keeper: threading.Thread | None = None
         self._stop_keeper = threading.Event()
+        self.device_name = ""
+        self.device_id = ""
 
     def __enter__(self) -> WindowsSystemAudio:
         import soundcard  # must come first: its import fails if this thread already started COM
 
         _start_com_for_this_thread()
         speaker = soundcard.get_speaker(self._speaker_name) if self._speaker_name else soundcard.default_speaker()
+        self._speaker = speaker
+        self.device_id = speaker.id
+        try:
+            self.device_name = speaker.name or ""
+        except Exception:  # only used to tell the user where the sound went
+            logger.warning("Could not read the output device's name", exc_info=True)
         microphone = soundcard.get_microphone(speaker.id, include_loopback=True)
         self._recorder = microphone.recorder(samplerate=_SAMPLE_RATE, channels=_CHANNELS)
         self._recorder.__enter__()
@@ -81,6 +93,21 @@ class WindowsSystemAudio:
     def read(self, frames: int) -> np.ndarray:
         block = self._recorder.record(numframes=frames)
         return (np.clip(block, -1.0, 1.0) * 32767).astype(np.int16)
+
+    def is_default(self) -> bool:
+        """Whether this device is still the default output. A device chosen by name is never left."""
+        if self._speaker_name:
+            return True
+        return self.default_id() == self.device_id
+
+    def default_id(self) -> str:
+        """The default output device's ID now. Raises when there is none (Windows: 0x80070490).
+
+        Call on a thread that has started COM, such as the one that opened this capture.
+        """
+        import soundcard
+
+        return soundcard.default_speaker().id
 
 
 def open_system_audio() -> WindowsSystemAudio:

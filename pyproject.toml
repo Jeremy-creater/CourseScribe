@@ -39,6 +39,7 @@ markers = [
   "integration: real running Ollama service",
   "gui: real desktop (audio capture, hotkeys, permissions, drag and drop)",
   "perf: timing measurements, not part of any gate",
+  "changes_system_settings: changes a system setting (such as the default output device); run only with the user's approval",
 ]
 
 [tool.coverage.run]
