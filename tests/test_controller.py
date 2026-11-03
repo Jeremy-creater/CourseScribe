@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import wave
 from datetime import datetime
 from pathlib import Path
 
@@ -12,9 +13,18 @@ import pytest
 
 from coursescribe.controller import SLEEP_WARNING, AppController
 from coursescribe.jobs import Job, JobStore, Stage
-from coursescribe.pipeline import ModelMissing, ProofreadBlocked, ProofreadResult
+from coursescribe.pipeline import (
+    RECORDING_HELD,
+    RECORDING_MISSING,
+    RECORDING_REPAIR_FAILED,
+    ModelMissing,
+    ProofreadBlocked,
+    ProofreadResult,
+)
 from coursescribe.segments import Segment
 from coursescribe.settings import Settings, SettingsStore
+from coursescribe.wavfile import repair_wav
+from test_recording import _crashed_wav, _disk_full_during_repair, _held
 
 NOW = datetime(2026, 11, 1, 19, 30)
 
@@ -24,8 +34,14 @@ class FakeTranscriber:
         self.models = []
         self.missing = set()
         self.gate = None
+        self.frames_seen: list[int] = []  # read from the file itself: what transcription really got
 
     def transcribe(self, audio, model, start_at, on_segment, on_progress):
+        try:
+            with wave.open(str(audio), "rb") as stream:
+                self.frames_seen.append(stream.getnframes())
+        except (wave.Error, EOFError):
+            pass  # the stand-in media files are not real audio
         self.models.append(model)
         if model in self.missing:
             raise ModelMissing(model)
@@ -634,16 +650,167 @@ def test_ignored_failures_stop_offering_a_retry(rig):
     assert rig.transcriber.models == []
 
 
-def test_recording_with_no_sound_is_not_offered_for_retry(rig):
+@pytest.mark.parametrize("content", ["nothing", "header only"])
+def test_recording_with_no_sound_is_not_offered_for_retry(rig, content):
     job = Job.new_recording(rig.tmp_path / "out", NOW, "large-v3", "model-a")
     from coursescribe.wavfile import WavWriter
 
-    WavWriter(job.audio_path, 48000, 2).close()  # stopped before any sound arrived
+    if content == "nothing":
+        job.audio_path.write_bytes(b"")
+    else:
+        WavWriter(job.audio_path, 48000, 2).close()  # stopped before any sound arrived
+    before = job.audio_path.read_bytes()
     rig.store.save(job)
     rig.controller.start()
     rig.wait_idle()
-    assert rig.store.load_all()[0].stage is Stage.FAILED
+    saved = rig.store.load_all()[0]
+    assert saved.stage is Stage.FAILED
     assert rig.controller.state.failed == 0
+    assert saved.can_retry is False and saved.message == "这次录音没有留下可用的声音。"
+    assert "占用" not in rig.controller.state.notice and "找不到" not in rig.controller.state.notice
+    assert job.audio_path.read_bytes() == before
+
+
+# --- recording that cannot be opened for repair (docs/plans/M2-held-recording-tests.md) ---
+
+
+def _interrupted_recording(rig, extra=b""):
+    """A recording the last run left behind when it crashed, waiting to be repaired."""
+    job = Job.new_recording(rig.tmp_path / "out", NOW, "large-v3", "model-a")
+    _crashed_wav(job.audio_path, 2.0, extra)
+    rig.store.save(job)
+    return job
+
+
+def _repaired_reference(rig, extra=b""):
+    """The same crashed recording repaired with nothing in the way: what every path must end at."""
+    reference = _crashed_wav(rig.tmp_path / "reference.wav", 2.0, extra)
+    repair_wav(reference)
+    return reference.read_bytes()
+
+
+def _assert_failed_with(rig, job, template, *words):
+    saved = rig.store.load_all()[0]
+    assert saved.stage is Stage.FAILED and saved.can_retry is True and saved.offers_retry
+    assert saved.message == template.format(path=job.audio_path)
+    state = rig.controller.state
+    assert state.failed == 1 and state.pending == 0
+    assert state.notice.startswith(f"{job.folder.name}：")
+    assert str(job.audio_path) in state.notice and "重试" in state.notice
+    for word in words:
+        assert word in state.notice
+    assert "没有留下可用的声音" not in state.notice
+
+
+def _assert_done_with_the_whole_recording(rig, job, reference):
+    saved = rig.store.load_all()[0]
+    assert saved.stage is Stage.DONE and saved.attempts == 0
+    assert rig.controller.state.failed == 0
+    assert rig.transcriber.frames_seen == [96000]
+    assert saved.txt_path.exists() and saved.md_path.exists()
+    assert job.audio_path.read_bytes() == reference
+    assert sorted(path.suffix for path in job.folder.iterdir()) == [".md", ".txt", ".wav"]
+
+
+def test_recording_held_at_restart_fails_with_a_retry_and_says_which_file(rig, monkeypatch):
+    monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", True)
+    job = _interrupted_recording(rig)
+    before = job.audio_path.read_bytes()
+    held = _held(monkeypatch, job.audio_path)
+    rig.controller.start()
+    rig.wait_idle()
+    _assert_failed_with(rig, job, RECORDING_HELD, "占用")
+    assert rig.transcriber.models == []
+    held.release()
+    assert job.audio_path.read_bytes() == before
+
+
+def test_recording_held_when_it_stops_fails_with_a_retry_and_says_which_file(rig, monkeypatch):
+    import os
+    import types
+
+    from coursescribe import wavfile
+
+    def fsync(fd):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", True)
+    rig.controller.start()
+    rig.controller.toggle_recording()
+    rig.wait(lambda: rig.controller.recording_seconds() >= 0.25)
+    job = rig.store.load_all()[0]
+    # The disk fills just as the recording stops: the writer's last flush fails (its file still closes).
+    monkeypatch.setattr(wavfile, "os", types.SimpleNamespace(**{**vars(os), "fsync": fsync}))
+    _held(monkeypatch, job.audio_path)
+    rig.controller.toggle_recording()
+    rig.wait_idle()
+    _assert_failed_with(rig, job, RECORDING_HELD, "占用")
+    assert rig.transcriber.models == []
+
+
+def test_ignoring_a_held_recording_leaves_the_recording_alone(rig, monkeypatch):
+    monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", True)
+    job = _interrupted_recording(rig)
+    before = job.audio_path.read_bytes()
+    held = _held(monkeypatch, job.audio_path)
+    rig.controller.start()
+    rig.wait_idle()
+    rig.controller.dismiss_failed()
+    held.release()
+    assert rig.controller.state.failed == 0
+    assert job.audio_path.read_bytes() == before
+
+
+def test_retry_while_still_held_says_the_same_and_after_letting_go_finishes_the_whole_recording(rig, monkeypatch):
+    monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", True)
+    job = _interrupted_recording(rig)
+    reference = _repaired_reference(rig)
+    held = _held(monkeypatch, job.audio_path)
+    rig.controller.start()
+    rig.wait_idle()
+
+    rig.controller.retry_failed()
+    rig.wait_idle()
+    _assert_failed_with(rig, job, RECORDING_HELD, "占用")
+    assert len(rig.store.load_all()) == 1
+
+    held.release()
+    rig.controller.retry_failed()
+    rig.wait_idle()
+    _assert_done_with_the_whole_recording(rig, job, reference)
+
+
+def test_recording_moved_away_says_so_and_finishes_once_put_back(rig):
+    job = _interrupted_recording(rig)
+    reference = _repaired_reference(rig)
+    moved = rig.tmp_path / "moved.wav"
+    job.audio_path.rename(moved)
+    rig.controller.start()
+    rig.wait_idle()
+    _assert_failed_with(rig, job, RECORDING_MISSING, "找不到", "放回", "硬盘")
+    assert not job.audio_path.exists()  # nothing made up in its place
+
+    moved.rename(job.audio_path)
+    rig.controller.retry_failed()
+    rig.wait_idle()
+    _assert_done_with_the_whole_recording(rig, job, reference)
+
+
+def test_disk_full_while_repairing_keeps_the_sound_and_retry_finishes_it(rig, monkeypatch):
+    extra = b"\x01\x02\x03"
+    job = _interrupted_recording(rig, extra)
+    reference = _repaired_reference(rig, extra)
+    sound = job.audio_path.read_bytes()[44 : 44 + 192000]
+    fault = _disk_full_during_repair(monkeypatch, job.audio_path, at="size2")
+    rig.controller.start()
+    rig.wait_idle()
+    _assert_failed_with(rig, job, RECORDING_REPAIR_FAILED, "磁盘")
+    assert job.audio_path.read_bytes()[44 : 44 + 192000] == sound
+
+    fault.at = None
+    rig.controller.retry_failed()
+    rig.wait_idle()
+    _assert_done_with_the_whole_recording(rig, job, reference)
 
 
 def _unusable_output(rig):

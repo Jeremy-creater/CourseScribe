@@ -8,6 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
+from coursescribe.files import _patiently
+
 _HEADER_SIZE = 44
 _BITS = 16
 _RIFF_SIZE_AT = 4
@@ -78,24 +80,28 @@ class WavWriter:
 def repair_wav(path: Path, max_data_bytes: int = MAX_DATA_BYTES) -> float:
     """Make a recording cut off by a crash readable. Returns its length in seconds.
 
-    Returns 0.0, changing nothing, when the file has no usable sound.
+    Returns 0.0 when the file is there but has no usable sound. A file that is gone,
+    held by another program or cannot be written raises its OSError instead, so it
+    is never taken for an empty recording. Repairing twice is harmless, so a held
+    file is simply tried again.
     """
-    try:
-        size = path.stat().st_size
-        with path.open("r+b") as stream:
-            head = stream.read(_HEADER_SIZE)
-            if len(head) < _HEADER_SIZE or head[:4] != b"RIFF" or head[8:12] != b"WAVE" or head[36:40] != b"data":
-                return 0.0
-            channels, rate = struct.unpack("<HI", head[22:28])
-            block = struct.unpack("<H", head[32:34])[0]
-            if not (channels and rate and block):
-                return 0.0
-            data_bytes = min(size - _HEADER_SIZE, max_data_bytes) // block * block
-            stream.truncate(_HEADER_SIZE + data_bytes)
-            stream.seek(_RIFF_SIZE_AT)
-            stream.write(struct.pack("<I", 36 + data_bytes))
-            stream.seek(_DATA_SIZE_AT)
-            stream.write(struct.pack("<I", data_bytes))
-    except OSError:
-        return 0.0
+    return _patiently(lambda: _repair(path, max_data_bytes))
+
+
+def _repair(path: Path, max_data_bytes: int) -> float:
+    with path.open("r+b") as stream:
+        head = stream.read(_HEADER_SIZE)
+        if len(head) < _HEADER_SIZE or head[:4] != b"RIFF" or head[8:12] != b"WAVE" or head[36:40] != b"data":
+            return 0.0
+        channels, rate = struct.unpack("<HI", head[22:28])
+        block = struct.unpack("<H", head[32:34])[0]
+        if not (channels and rate and block):
+            return 0.0
+        size = stream.seek(0, os.SEEK_END)
+        data_bytes = min(size - _HEADER_SIZE, max_data_bytes) // block * block
+        stream.truncate(_HEADER_SIZE + data_bytes)
+        stream.seek(_RIFF_SIZE_AT)
+        stream.write(struct.pack("<I", 36 + data_bytes))
+        stream.seek(_DATA_SIZE_AT)
+        stream.write(struct.pack("<I", data_bytes))
     return data_bytes / block / rate

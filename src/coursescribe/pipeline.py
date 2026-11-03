@@ -19,6 +19,16 @@ logger = logging.getLogger(__name__)
 
 StatusCallback = Callable[[Job, str, float | None], None]
 
+RECORDING_HELD = (
+    "录音文件 {path} 暂时打不开（可能正被别的程序占用，比如杀毒软件或播放器）。"
+    "录音还在。关掉占用它的程序，或等一会儿，再点“重试”。"
+)
+RECORDING_MISSING = (
+    "找不到录音文件 {path}，可能被移走或删除了，或者它所在的移动硬盘没插上。"
+    "把它放回原处或插回硬盘后点“重试”；不需要了就点“忽略”。"
+)
+RECORDING_REPAIR_FAILED = "录音文件 {path} 修复时出错（可能磁盘满了）。录音还在。腾出磁盘空间后点“重试”。"
+
 
 class ModelMissing(Exception):
     """The transcription model is not on this computer; downloading needs consent."""
@@ -113,7 +123,21 @@ class Pipeline:
             self.on_status(job, message, None)
 
     def _finish_interrupted_recording(self, job: Job) -> None:
-        if self.repair_recording(job.audio_path) <= 0:
+        try:
+            seconds = self.repair_recording(job.audio_path)
+        except FileNotFoundError as error:
+            logger.warning("Recording of job %s is missing: %s", job.job_id, error)
+            self._set(job, Stage.FAILED, RECORDING_MISSING.format(path=job.audio_path))
+            return
+        except PermissionError as error:
+            logger.warning("Recording of job %s is held: %s", job.job_id, error)
+            self._set(job, Stage.FAILED, RECORDING_HELD.format(path=job.audio_path))
+            return
+        except OSError:
+            logger.exception("Could not repair recording of job %s", job.job_id)
+            self._set(job, Stage.FAILED, RECORDING_REPAIR_FAILED.format(path=job.audio_path))
+            return
+        if seconds <= 0:
             self._set(job, Stage.FAILED, "这次录音没有留下可用的声音。", can_retry=False)
             return
         self._set(job, Stage.TRANSCRIBING)

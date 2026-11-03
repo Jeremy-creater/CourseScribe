@@ -77,6 +77,44 @@ def test_recording_survives_the_process_being_killed(tmp_path):
         assert sum(frame.samples for frame in media.decode(audio=0)) == pytest.approx(seconds * 48000, rel=0.01)
 
 
+def _wait_until_readable(path: Path, seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            with open(path, "rb"):
+                return
+        except PermissionError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.05)
+
+
+def test_repair_waits_out_a_short_real_hold_and_reports_a_long_one(tmp_path):
+    """A program that opens the recording without sharing (Windows only) must not make it count as empty."""
+    from coursescribe.platform import FILES_CAN_BE_HELD
+    from helpers import hold_without_sharing
+    from test_recording import _crashed_wav
+
+    briefly = _crashed_wav(tmp_path / "briefly.wav", 2.0)
+    hold_without_sharing(briefly, 0.3)
+    assert repair_wav(briefly) == pytest.approx(2.0)
+
+    long_held = _crashed_wav(tmp_path / "long.wav", 2.0)
+    before = long_held.read_bytes()
+    hold_without_sharing(long_held, 3.0)
+    if FILES_CAN_BE_HELD:
+        started = time.monotonic()
+        with pytest.raises(PermissionError):
+            repair_wav(long_held)
+        assert time.monotonic() - started < 2
+        _wait_until_readable(long_held, 5.0)
+        assert long_held.read_bytes() == before
+    assert repair_wav(long_held) == pytest.approx(2.0)
+    for path in (briefly, long_held):
+        with wave.open(str(path), "rb") as stream:
+            assert stream.getnframes() == 96000
+
+
 def _press_hotkey() -> None:
     import ctypes
 

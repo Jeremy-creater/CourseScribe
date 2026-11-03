@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import struct
 import threading
 import time
 import wave
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -28,6 +30,107 @@ def _read(path):
             stream.getnchannels(),
             np.frombuffer(stream.readframes(stream.getnframes()), dtype=np.int16),
         )
+
+
+def _crashed_wav(path, seconds=2.0, extra=b""):
+    """A recording cut off by a crash: all the sound is there, the header sizes still say empty."""
+    writer = WavWriter(path, RATE, 2)
+    writer.write(_tone(seconds))
+    writer.close()
+    raw = bytearray(path.read_bytes())
+    raw[4:8] = (36).to_bytes(4, "little")
+    raw[40:44] = (0).to_bytes(4, "little")
+    path.write_bytes(bytes(raw) + extra)
+    return path
+
+
+class _Held:
+    def __init__(self, times):
+        self.times = times
+        self.attempts = 0
+        self.released = False
+
+    def release(self):
+        self.released = True
+
+
+def _held(monkeypatch, path, times=None):
+    """Another program (antivirus, a player) has ``path`` open and Windows refuses to share it.
+
+    The first ``times`` opens are refused; ``None`` means until ``.release()``.
+    """
+    real_open = Path.open
+    target = Path(path)
+    held = _Held(times)
+
+    def open_(self, *args, **kwargs):
+        if Path(self) == target:
+            held.attempts += 1
+            if held.attempts > 100:
+                raise AssertionError("waited forever")
+            if not held.released and (held.times is None or held.attempts <= held.times):
+                raise PermissionError(13, "Permission denied")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_)
+    monkeypatch.setattr("coursescribe.files._REPLACE_WAIT", 0.001)
+    return held
+
+
+class _Fault:
+    def __init__(self, at):
+        self.at = at
+
+
+class _Faulty:
+    """A real open file whose change named by ``fault.at`` fails as on a full disk."""
+
+    def __init__(self, stream, fault):
+        self._stream = stream
+        self._fault = fault
+        self._writes = 0
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._stream.close()
+
+    def _check(self, action):
+        if self._fault.at == action:
+            raise OSError(28, "No space left on device")
+
+    def truncate(self, *args):
+        self._check("truncate")
+        return self._stream.truncate(*args)
+
+    def write(self, data):
+        self._writes += 1
+        self._check(f"size{self._writes}")
+        return self._stream.write(data)
+
+
+def _disk_full_during_repair(monkeypatch, path, at):
+    """The disk fills up at ``at``: "truncate", "size1" or "size2". Set ``.at = None`` to free space."""
+    real_open = Path.open
+    target = Path(path)
+    fault = _Fault(at)
+
+    def open_(self, *args, **kwargs):
+        stream = real_open(self, *args, **kwargs)
+        return _Faulty(stream, fault) if Path(self) == target else stream
+
+    monkeypatch.setattr(Path, "open", open_)
+    return fault
+
+
+# What WavWriter leaves when a recording stops before any sound arrives.
+_EMPTY_RECORDING = struct.pack(
+    "<4sI4s4sIHHIIHH4sI", b"RIFF", 36, b"WAVE", b"fmt ", 16, 1, 2, RATE, RATE * 4, 4, 16, b"data", 0
+)
 
 
 class TestWavWriter:
@@ -86,15 +189,7 @@ class TestWavWriter:
 
 class TestRepairWav:
     def _crashed_file(self, tmp_path, extra=b""):
-        target = tmp_path / "a.wav"
-        writer = WavWriter(target, RATE, 2)
-        writer.write(_tone(2.0))
-        writer.close()
-        raw = bytearray(target.read_bytes())
-        raw[4:8] = (36).to_bytes(4, "little")  # sizes still say "empty"
-        raw[40:44] = (0).to_bytes(4, "little")
-        target.write_bytes(bytes(raw) + extra)
-        return target
+        return _crashed_wav(tmp_path / "a.wav", 2.0, extra)
 
     def test_restores_the_sizes_and_reports_the_length(self, tmp_path):
         target = self._crashed_file(tmp_path)
@@ -116,12 +211,38 @@ class TestRepairWav:
         assert repair_wav(target) == pytest.approx(1.0)
         assert target.read_bytes() == before
 
-    @pytest.mark.parametrize("content", [b"", b"RIFF", b"not a wav file at all" * 10])
+    @pytest.mark.parametrize(
+        "content",
+        [
+            b"",
+            b"RIFF",
+            _EMPTY_RECORDING[:43],
+            b"not a wav file at all" * 10,
+            _EMPTY_RECORDING,
+            _EMPTY_RECORDING[:22] + b"\x00\x00" + _EMPTY_RECORDING[24:] + b"\x01\x02\x03\x04",
+            _EMPTY_RECORDING[:24] + b"\x00\x00\x00\x00" + _EMPTY_RECORDING[28:] + b"\x01\x02\x03\x04",
+            _EMPTY_RECORDING[:32] + b"\x00\x00" + _EMPTY_RECORDING[34:] + b"\x01\x02\x03\x04",
+        ],
+        ids=["empty", "riff-only", "short-header", "not-wav", "no-data", "no-channels", "no-rate", "no-block"],
+    )
     def test_unusable_file_means_no_sound(self, tmp_path, content):
         target = tmp_path / "a.wav"
         target.write_bytes(content)
         assert repair_wav(target) == 0.0
         assert target.read_bytes() == content
+
+    def test_repairing_a_crashed_file_twice_gives_the_same_file(self, tmp_path):
+        target = _crashed_wav(tmp_path / "a.wav", 2.0, extra=b"\x01\x02\x03")
+        assert repair_wav(target) == pytest.approx(2.0)
+        once = target.read_bytes()
+        assert repair_wav(target) == pytest.approx(2.0)
+        assert target.read_bytes() == once
+
+    def test_less_than_one_frame_of_sound_is_cut_to_an_empty_recording(self, tmp_path):
+        target = tmp_path / "a.wav"
+        target.write_bytes(_EMPTY_RECORDING + b"\x01\x02\x03")
+        assert repair_wav(target) == 0.0
+        assert target.read_bytes() == _EMPTY_RECORDING
 
     def test_file_past_the_size_limit_is_cut_to_it_instead_of_crashing(self, tmp_path):
         target = self._crashed_file(tmp_path)
@@ -129,8 +250,67 @@ class TestRepairWav:
         _, _, data = _read(target)
         assert len(data) == RATE * 2
 
-    def test_missing_file_means_no_sound(self, tmp_path):
-        assert repair_wav(tmp_path / "gone.wav") == 0.0
+    def test_empty_recording_constant_is_what_the_writer_leaves(self, tmp_path):
+        WavWriter(tmp_path / "e.wav", RATE, 2).close()
+        assert (tmp_path / "e.wav").read_bytes() == _EMPTY_RECORDING
+
+    def test_missing_file_is_reported_not_taken_for_silence(self, tmp_path):
+        """A recording moved away or deleted is not empty: putting it back and retrying must work."""
+        target = tmp_path / "gone.wav"
+        with pytest.raises(FileNotFoundError):
+            repair_wav(target)
+        assert not target.exists()
+
+    def test_briefly_held_file_is_repaired_once_let_go(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", True)
+        target = _crashed_wav(tmp_path / "a.wav", 2.0)
+        held = _held(monkeypatch, target, times=3)
+        assert repair_wav(target) == pytest.approx(2.0)
+        assert held.attempts == 4
+        with wave.open(str(target), "rb") as stream:
+            assert stream.getnframes() == 2 * RATE
+
+    def test_file_held_for_long_is_reported_and_left_alone(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", True)
+        target = _crashed_wav(tmp_path / "a.wav", 2.0)
+        before = target.read_bytes()
+        held = _held(monkeypatch, target)
+        with pytest.raises(PermissionError):
+            repair_wav(target)
+        assert held.attempts == 20  # about a second of patience, no more
+        held.release()
+        assert target.read_bytes() == before
+
+    def test_refusal_where_files_cannot_be_held_is_reported_at_once(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", False)
+        target = _crashed_wav(tmp_path / "a.wav", 2.0)
+        before = target.read_bytes()
+        held = _held(monkeypatch, target)
+        with pytest.raises(PermissionError):
+            repair_wav(target)
+        assert held.attempts == 1
+        held.release()
+        assert target.read_bytes() == before
+
+    @pytest.mark.parametrize("at", ["truncate", "size1", "size2"])
+    def test_disk_full_midway_keeps_the_sound_and_repairing_again_ends_as_if_once(self, tmp_path, monkeypatch, at):
+        extra = b"\x01\x02\x03"
+        target = _crashed_wav(tmp_path / "a.wav", 2.0, extra)
+        reference = _crashed_wav(tmp_path / "ref.wav", 2.0, extra)
+        sound = target.read_bytes()[44 : 44 + 2 * RATE * 4]
+        assert repair_wav(reference) == pytest.approx(2.0)
+
+        fault = _disk_full_during_repair(monkeypatch, target, at)
+        with pytest.raises(OSError) as caught:
+            repair_wav(target)
+        assert caught.value.errno == 28
+        after = target.read_bytes()
+        assert len(after) >= 44 + 2 * RATE * 4
+        assert after[44 : 44 + 2 * RATE * 4] == sound
+
+        fault.at = None
+        assert repair_wav(target) == pytest.approx(2.0)
+        assert target.read_bytes() == reference.read_bytes()
 
 
 class TestSilenceMonitor:
