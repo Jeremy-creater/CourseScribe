@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import gc
 import logging
 from collections.abc import Callable
 from pathlib import Path
 
-from coursescribe.pipeline import ModelMissing, NoAudio, Stopped
+from coursescribe.files import _patiently
+from coursescribe.pipeline import SOURCE_HELD, SOURCE_MISSING, ModelMissing, NoAudio, Stopped
 from coursescribe.segments import Segment
 
 logger = logging.getLogger(__name__)
@@ -107,11 +109,28 @@ class WhisperTranscriber:
         logger.info("Transcription model %s on %s", name, self.device)
         return self._model
 
+    def _decode_or_say_why(self, path: Path):
+        try:
+            return self._decode(path)
+        except OSError:
+            raise
+        except Exception as exc:
+            if getattr(exc, "errno", None) != errno.EINVAL:
+                raise
+            # On Windows the media engine reports a missing or held file with a non-ASCII name
+            # as an invalid argument; opening it here (read only) gives the real reason.
+            with path.open("rb"):
+                pass
+            raise
+
     def _read_audio(self, path: Path):
         try:
-            audio = self._decode(path)
+            audio = _patiently(lambda: self._decode_or_say_why(path))  # another program may have it open briefly
         except FileNotFoundError as exc:
-            raise NoAudio(f"找不到原文件：{path.name}。它可能被移动或删除了。") from exc
+            raise NoAudio(SOURCE_MISSING.format(path=path)) from exc
+        except PermissionError as exc:
+            logger.warning("Source file %s is held: %s", path.name, exc)
+            raise NoAudio(SOURCE_HELD.format(path=path)) from exc
         except Exception as exc:
             logger.warning("Could not decode %s: %s", path.name, exc)
             raise NoAudio(f"读不出这个文件的声音：{path.name}。") from exc

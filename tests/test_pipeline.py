@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +11,11 @@ import pytest
 
 from coursescribe.jobs import Job, JobStore, Stage
 from coursescribe.pipeline import (
+    TRANSCRIPT_EMPTY,
+    TRANSCRIPT_ENCODING,
+    TRANSCRIPT_HELD,
+    TRANSCRIPT_MISSING,
+    TRANSCRIPT_UNREADABLE,
     ModelMissing,
     NoAudio,
     Pipeline,
@@ -311,7 +317,88 @@ def test_checkpoints_are_removed_after_finishing(tmp_path):
     assert not store.proofread_path(job).exists()
 
 
-THREE_PARTS = [Segment(float(i), float(i + 1), mark * 89) for i, mark in enumerate("甲乙丙")]
+# --- transcript moved away before proofreading (docs/plans/M2-moved-transcript-tests.md) ---
+
+
+def test_transcript_deleted_before_proofreading_is_written_again_from_the_checkpoint(tmp_path):
+    reference_store = JobStore(tmp_path / "reference" / "state")
+    reference_proofreader = FakeProofreader()
+    (tmp_path / "reference").mkdir()
+    reference = _job(tmp_path / "reference", reference_store)
+    _pipeline(reference_store, proofreader=reference_proofreader).run(reference)
+
+    store = JobStore(tmp_path / "state")
+    job = _job(tmp_path, store)
+    _pipeline(store, proofreader=FakeProofreader(error=ProofreadBlocked("校对服务没有启动"))).run(job)
+    assert job.stage is Stage.WAITING_PROOFREAD
+    job.txt_path.unlink()
+
+    _pipeline(store).run(store.load_all()[0])
+    failed = store.load_all()[0]
+    assert failed.stage is Stage.FAILED and failed.can_retry
+    assert failed.message == TRANSCRIPT_MISSING.format(path=job.txt_path)
+    assert failed.retry_stage() is Stage.TRANSCRIBING
+
+    failed.stage = failed.retry_stage()
+    transcriber, proofreader = FakeTranscriber(), FakeProofreader()
+    _pipeline(store, transcriber, proofreader).run(failed)
+    final = store.load_all()[0]
+    assert final.stage is Stage.DONE
+    assert transcriber.starts == [] and transcriber.emitted == []  # the checkpoint already held all of it
+    assert final.txt_path.read_bytes() == RAW.encode()
+    assert proofreader.calls == reference_proofreader.calls == [RAW]
+    assert final.md_path.read_text(encoding="utf-8") == reference.md_path.read_text(encoding="utf-8")
+    assert sorted(p.name for p in final.folder.iterdir()) == ["课.md", "课.txt"]
+
+
+def test_a_finished_transcript_whose_checkpoint_is_gone_is_transcribed_again(tmp_path):
+    store = JobStore(tmp_path / "state")
+    job = _job(tmp_path, store)
+    job.transcript_complete = True  # e.g. the program data folder was cleaned
+    store.save(job)
+    transcriber = FakeTranscriber()
+    _pipeline(store, transcriber).run(store.load_all()[0])
+    final = store.load_all()[0]
+    assert final.stage is Stage.DONE
+    assert transcriber.starts == [0.0]
+    assert final.txt_path.read_bytes() == RAW.encode()
+
+
+def test_a_job_saved_before_transcripts_were_marked_complete_still_transcribes(tmp_path):
+    store = JobStore(tmp_path / "state")
+    job = _job(tmp_path, store)
+    record = store.folder / f"{job.job_id}.json"
+    raw = json.loads(record.read_text(encoding="utf-8"))
+    del raw["transcript_complete"]
+    record.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    old = store.load_all()[0]
+    assert old.transcript_complete is False
+    transcriber = FakeTranscriber()
+    _pipeline(store, transcriber).run(old)
+    assert store.load_all()[0].stage is Stage.DONE
+    assert transcriber.starts == [0.0]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError(28, "No space left on device"), PermissionError(13, "Permission denied"), ValueError("x")],
+    ids=["disk-full", "refused", "other"],
+)
+def test_errors_after_the_transcript_was_read_are_not_blamed_on_the_transcript(tmp_path, error):
+    store = JobStore(tmp_path / "state")
+    job = _job(tmp_path, store)
+    _pipeline(store, proofreader=FakeProofreader(error=error)).run(job)
+    assert job.stage is Stage.FAILED
+    transcript_messages = {
+        template.format(path=job.txt_path)
+        for template in (TRANSCRIPT_MISSING, TRANSCRIPT_HELD, TRANSCRIPT_UNREADABLE, TRANSCRIPT_ENCODING, TRANSCRIPT_EMPTY)
+    }
+    assert job.message not in transcript_messages
+    assert str(job.txt_path) not in job.message
+    assert job.txt_path.read_bytes() == RAW.encode()
+
+
+THREE_PARTS =[Segment(float(i), float(i + 1), mark * 89) for i, mark in enumerate("甲乙丙")]
 
 
 def _three_part_model(slow_part: str | None = None):

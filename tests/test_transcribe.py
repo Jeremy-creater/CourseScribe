@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from coursescribe.models import MODELS, model_size_label
-from coursescribe.pipeline import ModelMissing, NoAudio, Stopped
+from coursescribe.pipeline import SOURCE_HELD, SOURCE_MISSING, ModelMissing, NoAudio, Stopped
 from coursescribe.transcribe import SAMPLE_RATE, WhisperTranscriber
 
 AUDIO = Path("lesson.wav")
@@ -198,6 +198,123 @@ def test_unreadable_source_file_is_reported_in_plain_words():
 
     with pytest.raises(NoAudio, match="读不出"):
         _run(_transcriber(decode=decode))
+
+
+def _decode_test_audio(path):
+    """Reads the real file, so a missing one is reported by the file system; only the media engine is left out."""
+    Path(path).read_bytes()
+    return np.ones(SAMPLE_RATE, dtype=np.float32)
+
+
+def test_missing_source_file_says_where_it_was_and_what_to_do(tmp_path):
+    audio = tmp_path / "第一课.mp3"
+    transcriber = _transcriber(decode=_decode_test_audio)
+    with pytest.raises(NoAudio) as caught:
+        transcriber.transcribe(audio, "large-v3", 0.0, lambda s: None, lambda p, d: None)
+    message = str(caught.value)
+    assert message == SOURCE_MISSING.format(path=audio)
+    assert str(audio) in message and "放回" in message and "重试" in message
+    assert not audio.exists()
+    assert transcriber.loads == []
+
+
+class _HeldDecoder:
+    """Another program has the source file open and Windows refuses to share it, ``times`` times."""
+
+    def __init__(self, times=None, error=None):
+        self.times = times
+        self.error = error
+        self.attempts = 0
+
+    def __call__(self, path):
+        self.attempts += 1
+        if self.attempts > 100:
+            raise AssertionError("waited forever")
+        if self.times is None or self.attempts <= self.times:
+            raise self.error or PermissionError(13, "Permission denied")
+        return np.ones(SAMPLE_RATE, dtype=np.float32)
+
+
+@pytest.fixture
+def quick_waits(monkeypatch):
+    monkeypatch.setattr("coursescribe.files._REPLACE_WAIT", 0.001)
+
+
+def test_source_file_held_briefly_is_waited_for(monkeypatch, quick_waits):
+    monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", True)
+    decoder = _HeldDecoder(times=3)
+    segments, _ = _run(_transcriber(FakeModel([RawSegment(0, 1, "第一句")]), decode=decoder))
+    assert [s.text for s in segments] == ["第一句"]
+    assert decoder.attempts == 4
+
+
+@pytest.mark.parametrize(("can_be_held", "attempts"), [(True, 20), (False, 1)], ids=["windows", "mac"])
+def test_source_file_that_stays_held_is_called_held_not_soundless(monkeypatch, quick_waits, can_be_held, attempts):
+    monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", can_be_held)
+    decoder = _HeldDecoder()
+    transcriber = _transcriber(decode=decoder)
+    with pytest.raises(NoAudio) as caught:
+        _run(transcriber)
+    message = str(caught.value)
+    assert message == SOURCE_HELD.format(path=AUDIO)
+    assert "读不出" not in message and "没有声音" not in message
+    assert decoder.attempts == attempts
+    assert transcriber.loads == []
+
+
+def test_source_on_an_unplugged_drive_is_not_called_held(monkeypatch, quick_waits):
+    monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", True)
+    decoder = _HeldDecoder(error=OSError(5, "Input/output error"))
+    with pytest.raises(NoAudio) as caught:
+        _run(_transcriber(decode=decoder))
+    assert str(caught.value) == f"读不出这个文件的声音：{AUDIO.name}。"
+    assert decoder.attempts == 1
+
+
+class _EngineArgumentError(ValueError):
+    """What the media engine (PyAV) raises on Windows for a missing or held file with a non-ASCII name."""
+
+    errno = 22
+
+
+def _engine_cannot_open(path):
+    raise _EngineArgumentError(f"Invalid argument: '{path}' returned 22")
+
+
+def test_missing_source_with_a_chinese_name_is_found_missing_even_though_the_engine_says_invalid(tmp_path):
+    audio = tmp_path / "第一课.mp3"
+    with pytest.raises(NoAudio) as caught:
+        _run_on(_transcriber(decode=_engine_cannot_open), audio)
+    assert str(caught.value) == SOURCE_MISSING.format(path=audio)
+    assert not audio.exists()
+
+
+def test_held_source_with_a_chinese_name_is_found_held_even_though_the_engine_says_invalid(tmp_path, monkeypatch):
+    from test_recording import _held
+
+    monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", True)
+    audio = tmp_path / "第一课.mp3"
+    audio.write_bytes(b"audio")
+    held = _held(monkeypatch, audio)
+    with pytest.raises(NoAudio) as caught:
+        _run_on(_transcriber(decode=_engine_cannot_open), audio)
+    assert str(caught.value) == SOURCE_HELD.format(path=audio)
+    assert held.attempts == 20
+    held.release()
+    assert audio.read_bytes() == b"audio"
+
+
+def test_readable_source_the_engine_calls_invalid_is_reported_as_unreadable(tmp_path):
+    audio = tmp_path / "第一课.mp3"
+    audio.write_bytes(b"audio")
+    with pytest.raises(NoAudio) as caught:
+        _run_on(_transcriber(decode=_engine_cannot_open), audio)
+    assert str(caught.value) == "读不出这个文件的声音：第一课.mp3。"
+    assert audio.read_bytes() == b"audio"
+
+
+def _run_on(transcriber, audio):
+    transcriber.transcribe(audio, "large-v3", 0.0, lambda s: None, lambda p, d: None)
 
 
 def test_file_with_no_sound_is_reported():

@@ -113,6 +113,8 @@ class Job:
     attempts: int = 0  # runs started and not ended normally; more than one means it crashed the program
     can_retry: bool = True
     dismissed: bool = False
+    # the whole transcription is in the checkpoint, so a lost .txt is written again without transcribing
+    transcript_complete: bool = False
 
     @classmethod
     def new_recording(cls, root: Path, now: datetime, transcribe_model: str, proofread_model: str) -> Job:

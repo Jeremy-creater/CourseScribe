@@ -54,10 +54,11 @@ class _Held:
         self.released = True
 
 
-def _held(monkeypatch, path, times=None):
+def _held(monkeypatch, path, times=None, error=None):
     """Another program (antivirus, a player) has ``path`` open and Windows refuses to share it.
 
     The first ``times`` opens are refused; ``None`` means until ``.release()``.
+    ``error`` replaces the refusal with another failure, such as ``OSError(5, ...)`` for an unplugged drive.
     """
     real_open = Path.open
     target = Path(path)
@@ -69,6 +70,8 @@ def _held(monkeypatch, path, times=None):
             if held.attempts > 100:
                 raise AssertionError("waited forever")
             if not held.released and (held.times is None or held.attempts <= held.times):
+                if error is not None:
+                    raise type(error)(*error.args)
                 raise PermissionError(13, "Permission denied")
         return real_open(self, *args, **kwargs)
 

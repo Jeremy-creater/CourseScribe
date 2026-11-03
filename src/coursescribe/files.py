@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import tempfile
@@ -123,6 +124,44 @@ def _patiently(action: Callable[[], Any]) -> Any:
                 raise  # elsewhere a refusal is real and does not clear by waiting
             time.sleep(_REPLACE_WAIT)
     return action()
+
+
+class UnknownEncoding(ValueError):
+    """The bytes are not in an encoding that can be told for sure."""
+
+
+_TRANSCRIPT_MARKS = (
+    (codecs.BOM_UTF8, "utf-8"),
+    (codecs.BOM_UTF16_LE, "utf-16-le"),
+    (codecs.BOM_UTF16_BE, "utf-16-be"),
+)
+
+
+def _read_bytes_once(path: Path) -> bytes:
+    with path.open("rb") as stream:
+        return stream.read()
+
+
+def read_transcript(path: Path) -> str:
+    """Read a transcript the user may have re-saved, exactly as written; this never changes the file.
+
+    Only encodings that can be told for sure are accepted: UTF-8, and UTF-8 or UTF-16 marked
+    by a byte order mark. Anything else raises UnknownEncoding rather than being guessed, because
+    a wrong guess would be proofread into a normal-looking but garbled .md.
+    """
+    data = _patiently(lambda: _read_bytes_once(path))
+    body, encoding = data, "utf-8"
+    for mark, marked_encoding in _TRANSCRIPT_MARKS:
+        if data.startswith(mark):
+            body, encoding = data[len(mark) :], marked_encoding
+            break
+    try:
+        text = body.decode(encoding)
+    except UnicodeDecodeError as exc:
+        raise UnknownEncoding(f"{path.name} is not {encoding}") from exc
+    if "\x00" in text:  # UTF-16 without a mark often decodes as UTF-8 full of NULs
+        raise UnknownEncoding(f"{path.name} has NUL characters")
+    return text
 
 
 def read_json(path: Path) -> Any:

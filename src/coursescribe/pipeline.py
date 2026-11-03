@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from coursescribe.files import commit_new_text
+from coursescribe.files import UnknownEncoding, commit_new_text, read_transcript
 from coursescribe.jobs import Job, JobStore, Stage
 from coursescribe.segments import Segment, append_segment, read_segments, segments_to_text
 
@@ -28,6 +28,30 @@ RECORDING_MISSING = (
     "把它放回原处或插回硬盘后点“重试”；不需要了就点“忽略”。"
 )
 RECORDING_REPAIR_FAILED = "录音文件 {path} 修复时出错（可能磁盘满了）。录音还在。腾出磁盘空间后点“重试”。"
+
+TRANSCRIPT_MISSING = (
+    "找不到文字稿 {path}，可能被移走、改名或删除了。把它放回原处后点“重试”；"
+    "找不回来也可以直接点“重试”，程序会重新生成文字稿再校对。"
+)
+TRANSCRIPT_HELD = (
+    "文字稿 {path} 暂时打不开（可能正被别的程序占用，比如正在编辑它的软件）。"
+    "关掉那个程序，或等一会儿，再点“重试”。"
+)
+TRANSCRIPT_UNREADABLE = "读不了文字稿 {path}（可能它所在的硬盘被拔掉了，或没有权限）。处理好后点“重试”。"
+TRANSCRIPT_ENCODING = (
+    "文字稿 {path} 的编码认不出来（可能被另存成了别的编码）。用文本编辑器打开它，另存为 UTF-8 编码，再点“重试”。"
+)
+TRANSCRIPT_EMPTY = (
+    "文字稿 {path} 是空的，没有可以校对的内容。把内容恢复后点“重试”；"
+    "或者把这个空文件删掉再点“重试”，程序会重新生成文字稿。"
+)
+
+SOURCE_MISSING = (
+    "找不到要转录的文件 {path}，可能被移走、改名或删除了。把它放回原处后点“重试”；不需要了就点“忽略”。"
+)
+SOURCE_HELD = (
+    "要转录的文件 {path} 暂时打不开（可能正被别的程序占用）。关掉占用它的程序，或等一会儿，再点“重试”。"
+)
 
 
 class ModelMissing(Exception):
@@ -145,8 +169,23 @@ class Pipeline:
     def _transcribe(self, job: Job) -> None:
         checkpoint = self.store.segments_path(job)
         done = read_segments(checkpoint)
-        start_at = done[-1].end if done else 0.0
         job.message = ""
+        if job.transcript_complete and done:
+            # the transcript was written once and then lost: the checkpoint holds all of it
+            segments = done
+        else:
+            self._run_transcriber(job, checkpoint, done[-1].end if done else 0.0)
+            segments = read_segments(checkpoint)
+        if not segments:
+            self._set(job, Stage.FAILED, "没有识别到说话的声音，所以没有生成文字稿。", can_retry=False)
+            self.transcriber.release()
+            return
+        job.txt_path = commit_new_text(job.txt_path, segments_to_text(segments))
+        self.transcriber.release()
+        job.transcript_complete = True
+        self._set(job, Stage.PROOFREADING)
+
+    def _run_transcriber(self, job: Job, checkpoint: Path, start_at: float) -> None:
         self.on_status(job, "正在准备转录", None)
 
         def on_progress(position: float, duration: float) -> None:
@@ -161,17 +200,33 @@ class Pipeline:
             lambda segment: append_segment(checkpoint, segment),
             on_progress,
         )
-        segments = read_segments(checkpoint)
-        if not segments:
-            self._set(job, Stage.FAILED, "没有识别到说话的声音，所以没有生成文字稿。", can_retry=False)
-            self.transcriber.release()
-            return
-        job.txt_path = commit_new_text(job.txt_path, segments_to_text(segments))
-        self.transcriber.release()
-        self._set(job, Stage.PROOFREADING)
+
+    def _read_transcript(self, job: Job) -> str | None:
+        """The transcript as the user left it, or None after telling them why it cannot be proofread."""
+        try:
+            text = read_transcript(job.txt_path)
+        except (OSError, UnknownEncoding) as error:
+            if isinstance(error, FileNotFoundError):
+                problem = TRANSCRIPT_MISSING
+            elif isinstance(error, PermissionError):
+                problem = TRANSCRIPT_HELD
+            elif isinstance(error, OSError):
+                problem = TRANSCRIPT_UNREADABLE
+            else:
+                problem = TRANSCRIPT_ENCODING
+            logger.warning("Transcript of job %s cannot be read: %s", job.job_id, error)
+        else:
+            if text.strip():
+                return text
+            logger.warning("Transcript of job %s is empty", job.job_id)
+            problem = TRANSCRIPT_EMPTY
+        self._set(job, Stage.FAILED, problem.format(path=job.txt_path))
+        return None
 
     def _proofread(self, job: Job) -> None:
-        text = job.txt_path.read_bytes().decode("utf-8")
+        text = self._read_transcript(job)
+        if text is None:
+            return
         job.message = ""
         self.on_status(job, "正在准备校对", None)
 

@@ -17,6 +17,11 @@ from coursescribe.pipeline import (
     RECORDING_HELD,
     RECORDING_MISSING,
     RECORDING_REPAIR_FAILED,
+    TRANSCRIPT_EMPTY,
+    TRANSCRIPT_ENCODING,
+    TRANSCRIPT_HELD,
+    TRANSCRIPT_MISSING,
+    TRANSCRIPT_UNREADABLE,
     ModelMissing,
     ProofreadBlocked,
     ProofreadResult,
@@ -1455,3 +1460,178 @@ def test_cut_name_is_kept_when_the_job_resumes_after_a_restart(tmp_path, monkeyp
     assert sorted(p.name for p in (out / name).iterdir()) == sorted([f"{name}.txt", f"{name}.md"])
     assert second.store.load_all()[0].folder == saved.folder
     second.check_keep_awake_follows_busy()
+
+
+# --- transcript moved, held or re-saved before proofreading (docs/plans/M2-moved-transcript-tests.md) ---
+
+
+NORMAL_MD = "# 第一课\n\n第一课的内容。\n"
+
+
+def _transcript_waiting(rig):
+    """A file job whose transcript is written and which waits for the proofreading service."""
+    rig.controller.start()
+    _waiting_for_proofreading(rig)
+    rig.proofreader.models.clear()
+    job = rig.store.load_all()[0]
+    assert job.stage is Stage.WAITING_PROOFREAD and job.txt_path.exists()
+    return job
+
+
+def _snapshot(path):
+    return path.read_bytes(), path.stat().st_mtime_ns
+
+
+def _assert_transcript_failure(rig, job, template, txt_where, txt_bytes, txt_mtime):
+    saved = rig.store.load_all()[0]
+    assert saved.stage is Stage.FAILED and saved.can_retry is True and saved.offers_retry
+    assert saved.message == template.format(path=job.txt_path)
+    state = rig.controller.state
+    assert (state.failed, state.waiting_proofread, state.pending) == (1, 0, 0)
+    assert state.notice.startswith(f"{job.folder.name}：")
+    assert str(job.txt_path) in state.notice and "重试" in state.notice
+    for blamed in ("Ollama", "校对服务", "处理时出错了"):
+        assert blamed not in state.notice
+    assert rig.proofreader.models == []
+    assert not job.md_path.exists()
+    assert txt_where.read_bytes() == txt_bytes
+    assert txt_where.stat().st_mtime_ns == txt_mtime
+
+
+def _moved_while_waiting(rig):
+    job = _transcript_waiting(rig)
+    snapshot = _snapshot(job.txt_path)
+    moved = rig.tmp_path / "moved.txt"
+    job.txt_path.rename(moved)
+    rig.controller.retry_waiting()
+    rig.wait_idle()
+    return job, moved, snapshot
+
+
+def _moved_before_a_restart(rig):
+    job = _saved_job(rig, stage=Stage.PROOFREADING)
+    job.txt_path.write_bytes("第一课的内容\n".encode())
+    snapshot = _snapshot(job.txt_path)
+    moved = rig.tmp_path / "moved.txt"
+    job.txt_path.rename(moved)
+    rig.controller.start()
+    rig.wait_idle()
+    return job, moved, snapshot
+
+
+@pytest.mark.parametrize("move", [_moved_while_waiting, _moved_before_a_restart], ids=["continue", "restart"])
+def test_transcript_moved_away_says_which_file_and_what_to_do(rig, move):
+    job, moved, snapshot = move(rig)
+    _assert_transcript_failure(rig, job, TRANSCRIPT_MISSING, moved, *snapshot)
+    assert snapshot[0] == "第一课的内容\n".encode()
+    assert "放回" in rig.controller.state.notice
+    assert not job.txt_path.exists()  # nothing made up in its place
+
+
+def test_transcript_put_back_and_retried_finishes_as_if_nothing_happened(rig):
+    job, moved, (before, _) = _moved_while_waiting(rig)
+    moved.rename(job.txt_path)
+    rig.controller.retry_failed()
+    rig.wait_idle()
+    saved = rig.store.load_all()[0]
+    assert saved.stage is Stage.DONE
+    assert rig.controller.state.failed == 0
+    assert saved.md_path.read_text(encoding="utf-8") == NORMAL_MD
+    assert rig.proofreader.models == ["model-a"]
+    assert job.txt_path.read_bytes() == before
+    assert sorted(p.name for p in job.folder.iterdir()) == ["第一课.md", "第一课.txt"]
+
+
+@pytest.mark.parametrize("encode", [lambda text: text.encode("utf-8-sig")], ids=["utf-8-bom"])
+def test_transcript_resaved_in_an_encoding_that_is_certain_is_proofread_without_the_mark(rig, encode):
+    job = _transcript_waiting(rig)
+    data = encode("第一课的内容（改过）\n")
+    job.txt_path.write_bytes(data)
+    rig.controller.retry_waiting()
+    rig.wait_idle()
+    saved = rig.store.load_all()[0]
+    assert saved.stage is Stage.DONE
+    assert saved.md_path.read_text(encoding="utf-8") == "# 第一课\n\n第一课的内容（改过）。\n"
+    assert job.txt_path.read_bytes() == data
+
+
+def test_transcript_resaved_in_an_unknown_encoding_says_how_to_fix_it_and_finishes_once_fixed(rig):
+    job = _transcript_waiting(rig)
+    job.txt_path.write_bytes("第一课的内容（改过）\n".encode("gbk"))
+    snapshot = _snapshot(job.txt_path)
+    rig.controller.retry_waiting()
+    rig.wait_idle()
+    _assert_transcript_failure(rig, job, TRANSCRIPT_ENCODING, job.txt_path, *snapshot)
+    assert "编码" in rig.controller.state.notice and "UTF-8" in rig.controller.state.notice
+
+    fixed = "第一课的内容（改过）\n".encode("utf-8")
+    job.txt_path.write_bytes(fixed)
+    rig.controller.retry_failed()
+    rig.wait_idle()
+    saved = rig.store.load_all()[0]
+    assert saved.stage is Stage.DONE and rig.controller.state.failed == 0
+    assert saved.md_path.read_text(encoding="utf-8") == "# 第一课\n\n第一课的内容（改过）。\n"
+    assert job.txt_path.read_bytes() == fixed
+
+
+@pytest.mark.parametrize(
+    ("error", "template", "attempts"),
+    [(None, TRANSCRIPT_HELD, 20), (OSError(5, "Input/output error"), TRANSCRIPT_UNREADABLE, 1)],
+    ids=["held", "unplugged"],
+)
+def test_transcript_that_cannot_be_opened_says_why_and_finishes_once_let_go(rig, monkeypatch, error, template, attempts):
+    monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", True)
+    job = _transcript_waiting(rig)
+    snapshot = _snapshot(job.txt_path)
+    held = _held(monkeypatch, job.txt_path, error=error)
+    rig.controller.retry_waiting()
+    rig.wait_idle()
+    assert held.attempts == attempts
+    held.release()
+    _assert_transcript_failure(rig, job, template, job.txt_path, *snapshot)
+
+    rig.controller.retry_failed()
+    rig.wait_idle()
+    saved = rig.store.load_all()[0]
+    assert saved.stage is Stage.DONE and rig.controller.state.failed == 0
+    assert saved.md_path.read_text(encoding="utf-8") == NORMAL_MD
+    assert job.txt_path.read_bytes() == snapshot[0]
+
+
+def test_emptied_transcript_makes_no_title_only_md_and_deleting_it_writes_it_again(rig):
+    job = _transcript_waiting(rig)
+    job.txt_path.write_bytes(b" \r\n\n\t")
+    snapshot = _snapshot(job.txt_path)
+    rig.controller.retry_waiting()
+    rig.wait_idle()
+    _assert_transcript_failure(rig, job, TRANSCRIPT_EMPTY, job.txt_path, *snapshot)
+    assert "空的" in rig.controller.state.notice
+    assert list(job.folder.glob("*.md")) == []
+
+    job.txt_path.unlink()
+    rig.transcriber.models.clear()
+    rig.controller.retry_failed()
+    rig.wait_idle()
+    saved = rig.store.load_all()[0]
+    assert saved.stage is Stage.DONE and rig.controller.state.failed == 0
+    assert job.txt_path.read_text(encoding="utf-8") == "第一课的内容\n"
+    assert saved.md_path.read_text(encoding="utf-8") == NORMAL_MD
+    assert rig.transcriber.models == []  # written again from what was already transcribed
+
+
+def test_retrying_an_unsolved_transcript_problem_says_the_same_and_touches_nothing(rig):
+    job = _transcript_waiting(rig)
+    job.txt_path.write_bytes("第一课的内容\n".encode("gbk"))
+    snapshot = _snapshot(job.txt_path)
+    rig.controller.retry_waiting()
+    rig.wait_idle()
+    _assert_transcript_failure(rig, job, TRANSCRIPT_ENCODING, job.txt_path, *snapshot)
+    for _ in range(2):
+        rig.controller.retry_failed()
+        rig.wait_idle()
+        _assert_transcript_failure(rig, job, TRANSCRIPT_ENCODING, job.txt_path, *snapshot)
+        saved = rig.store.load_all()
+        assert len(saved) == 1 and saved[0].attempts == 0
+        assert sorted(p.name for p in rig.store.folder.iterdir()) == sorted(
+            [f"{job.job_id}.json", f"{job.job_id}.segments.jsonl"]
+        )

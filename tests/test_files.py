@@ -4,7 +4,16 @@ import json
 
 import pytest
 
-from coursescribe.files import atomic_write_json, commit_new_text, read_json, unique_dir, unique_path
+from coursescribe.files import (
+    UnknownEncoding,
+    atomic_write_json,
+    commit_new_text,
+    read_json,
+    read_transcript,
+    unique_dir,
+    unique_path,
+)
+from test_recording import _held
 
 
 def test_unique_path_returns_the_name_when_free(tmp_path):
@@ -197,3 +206,125 @@ def test_json_read_gives_up_on_a_file_that_stays_held(tmp_path, monkeypatch, fil
     _briefly_held(monkeypatch, 1000)
     with pytest.raises(PermissionError):
         read_json(target)
+
+
+# --- reading back a transcript the user may have moved, held or re-saved (docs/plans/M2-moved-transcript-tests.md) ---
+
+TRANSCRIPT_TEXTS = [
+    "第一句，讲 Python 的 list。\n第二句 😀\n",
+    "a",
+    "\r\n中文\r\n",
+    "  首尾有空白  \n",
+    "中" * 200_000,
+]
+TRANSCRIPT_ENCODINGS = {
+    "utf-8": lambda text: text.encode("utf-8"),
+    "utf-8 with BOM": lambda text: text.encode("utf-8-sig"),
+    "utf-16 default": lambda text: text.encode("utf-16"),
+    "utf-16 little-endian with BOM": lambda text: b"\xff\xfe" + text.encode("utf-16-le"),
+    "utf-16 big-endian with BOM": lambda text: b"\xfe\xff" + text.encode("utf-16-be"),
+}
+
+
+def _transcript_file(tmp_path, data):
+    path = tmp_path / "课.txt"
+    path.write_bytes(data)
+    return path, path.stat().st_mtime_ns
+
+
+@pytest.mark.parametrize("encoding", TRANSCRIPT_ENCODINGS)
+@pytest.mark.parametrize("text", TRANSCRIPT_TEXTS, ids=["mixed", "one-char", "crlf", "spaces", "long"])
+def test_transcript_in_any_accepted_encoding_reads_back_exactly_and_is_left_alone(tmp_path, text, encoding):
+    data = TRANSCRIPT_ENCODINGS[encoding](text)
+    path, mtime = _transcript_file(tmp_path, data)
+    assert read_transcript(path) == text
+    assert path.read_bytes() == data
+    assert path.stat().st_mtime_ns == mtime
+    assert [p.name for p in tmp_path.iterdir()] == ["课.txt"]
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        "第一句，讲 Python。".encode("gbk"),
+        "第一句".encode("utf-16-le"),
+        "abc".encode("utf-16-le"),
+        "café".encode("latin-1"),
+        b"\xef\xbb\xbf" + "中".encode("gbk"),
+        b"\xff\xfe" + b"\x00",
+    ],
+    ids=["gbk", "utf-16-no-bom", "ascii-utf-16-no-bom", "latin-1", "utf-8-bom-over-gbk", "utf-16-bom-odd-bytes"],
+)
+def test_transcript_in_an_encoding_that_cannot_be_told_for_sure_is_refused(tmp_path, data):
+    path, mtime = _transcript_file(tmp_path, data)
+    with pytest.raises(UnknownEncoding) as caught:
+        read_transcript(path)
+    assert not isinstance(caught.value, OSError)
+    assert path.read_bytes() == data
+    assert path.stat().st_mtime_ns == mtime
+
+
+@pytest.mark.parametrize(
+    ("data", "text"),
+    [
+        ("Hello, world\n".encode("gbk"), "Hello, world\n"),
+        (b"", ""),
+        (b"\xef\xbb\xbf", ""),
+    ],
+    ids=["plain-ascii", "empty", "bom-only"],
+)
+def test_transcript_whose_encoding_is_certain_is_read_even_at_the_edges(tmp_path, data, text):
+    path, _ = _transcript_file(tmp_path, data)
+    assert read_transcript(path) == text
+    assert path.read_bytes() == data
+
+
+def test_transcript_that_is_gone_is_reported_and_not_made_up(tmp_path):
+    gone = tmp_path / "gone.txt"
+    with pytest.raises(FileNotFoundError):
+        read_transcript(gone)
+    assert not gone.exists()
+
+
+def test_transcript_held_briefly_is_waited_for(tmp_path, monkeypatch, files_can_be_held):
+    data = "第一课的内容\n".encode()
+    path, _ = _transcript_file(tmp_path, data)
+    held = _held(monkeypatch, path, times=3)
+    assert read_transcript(path) == "第一课的内容\n"
+    assert held.attempts == 4
+    assert path.read_bytes() == data
+
+
+def test_transcript_held_for_long_is_reported_after_about_a_second(tmp_path, monkeypatch, files_can_be_held):
+    data = "第一课的内容\n".encode()
+    path, _ = _transcript_file(tmp_path, data)
+    held = _held(monkeypatch, path)
+    with pytest.raises(PermissionError):
+        read_transcript(path)
+    assert held.attempts == 20
+    held.release()
+    assert path.read_bytes() == data
+
+
+def test_transcript_refused_where_files_cannot_be_held_is_reported_at_once(tmp_path, monkeypatch):
+    monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", False)
+    data = "第一课的内容\n".encode()
+    path, _ = _transcript_file(tmp_path, data)
+    held = _held(monkeypatch, path)
+    with pytest.raises(PermissionError):
+        read_transcript(path)
+    assert held.attempts == 1
+    held.release()
+    assert path.read_bytes() == data
+
+
+def test_transcript_on_an_unplugged_drive_is_reported_at_once(tmp_path, monkeypatch, files_can_be_held):
+    data = "第一课的内容\n".encode()
+    path, _ = _transcript_file(tmp_path, data)
+    held = _held(monkeypatch, path, error=OSError(5, "Input/output error"))
+    with pytest.raises(OSError) as caught:
+        read_transcript(path)
+    assert caught.value.errno == 5 and not isinstance(caught.value, PermissionError)
+    assert held.attempts == 1  # not a hold, so no waiting
+    held.release()
+    assert path.read_bytes() == data

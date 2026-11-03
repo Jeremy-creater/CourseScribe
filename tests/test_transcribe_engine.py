@@ -8,7 +8,7 @@ import subprocess
 
 import pytest
 
-from coursescribe.pipeline import NoAudio
+from coursescribe.pipeline import SOURCE_MISSING, NoAudio
 from coursescribe.segments import segments_to_text
 from coursescribe.text import content_chars
 from coursescribe.transcribe import WhisperTranscriber, is_model_downloaded
@@ -90,6 +90,14 @@ def test_not_a_media_file_is_reported(transcriber, tmp_path):
     fake.write_bytes(b"this is not audio")
     with pytest.raises(NoAudio):
         transcriber.transcribe(fake, MODEL, 0.0, lambda s: None, lambda p, d: None)
+
+
+def test_source_file_that_is_gone_says_where_it_was_with_the_real_decoder(transcriber, tmp_path):
+    gone = tmp_path / "不存在.mp3"
+    with pytest.raises(NoAudio) as caught:
+        transcriber.transcribe(gone, MODEL, 0.0, lambda s: None, lambda p, d: None)
+    assert str(caught.value) == SOURCE_MISSING.format(path=gone)
+    assert not gone.exists()
 
 
 def _gpu_memory_used_mb() -> int:
