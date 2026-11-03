@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import coursescribe.pipeline as flow
 from coursescribe.jobs import Job, JobStore, Stage
 from coursescribe.pipeline import (
     TRANSCRIPT_EMPTY,
@@ -25,9 +27,11 @@ from coursescribe.pipeline import (
 )
 from coursescribe.ollama import OllamaClient
 from coursescribe.proofread import BREAK_MARKER, TEXT_MARKER, TIMEOUT_MESSAGE, OllamaProofreader
-from coursescribe.segments import Segment, segments_to_text
+from coursescribe.segments import Segment, read_segments, segments_to_text
 from coursescribe.text import content_chars
+from coursescribe.transcribe import WhisperTranscriber
 from fake_ollama import FakeOllama, Reply
+from test_transcribe import Engines, _broken_driver, five_seconds, quiet_logs  # noqa: F401 (a fixture)
 
 NOW = datetime(2026, 11, 1, 19, 30)
 SEGMENTS = [Segment(float(i), float(i + 1), f"第{i}句") for i in range(5)]
@@ -47,6 +51,7 @@ class FakeTranscriber:
     emitted: list[Segment] = field(default_factory=list)
     releases: int = 0
     events: list[str] | None = None
+    fell_back_to_cpu: bool = False
 
     def transcribe(self, audio: Path, model: str, start_at: float, on_segment, on_progress) -> None:
         self.starts.append(start_at)
@@ -101,8 +106,8 @@ class CrashingStore(JobStore):
             raise Crash
 
 
-def _job(tmp_path: Path, store: JobStore) -> Job:
-    source = tmp_path / "课.mp3"
+def _job(tmp_path: Path, store: JobStore, name: str = "课.mp3") -> Job:
+    source = tmp_path / name
     source.write_bytes(b"audio")
     job = Job.new_file(source, tmp_path / "out", NOW, "large-v3", "model-a")
     store.save(job)
@@ -448,3 +453,176 @@ def test_slow_proofreading_service_waits_then_resumes_into_one_md(tmp_path):
     assert markdown.startswith("# 课\n\n")
     assert content_chars(markdown.removeprefix("# 课\n\n")) == content_chars(expected_txt.decode("utf-8"))
     assert final.txt_path.read_bytes() == expected_txt
+
+
+# --- the GPU cannot be used this time (docs/plans/M2-gpu-fallback-tests.md) ---
+# The real WhisperTranscriber, with stand-ins only for the engine and the graphics driver.
+
+GENERIC_FAILURE = "处理时出错了。录音和已有文件都还在，详情见日志。"
+_PROOFREAD_TAIL = ["正在准备校对", "正在校对（第 1/3 段）", "完成"]
+PLAIN_STATUSES = ["正在准备转录", *[f"正在转录（{p}%）" for p in (20, 40, 60, 80, 100)], *_PROOFREAD_TAIL]
+
+
+def _noted(percents):
+    return [f"正在转录（{p}%）。{flow.CPU_FALLBACK_NOTE}" for p in percents]
+
+
+def _fallback_at_load():
+    return ["正在准备转录", *_noted((0, 20, 40, 60, 80, 100)), *_PROOFREAD_TAIL]
+
+
+def _fallback_after_first_segment():
+    return ["正在准备转录", "正在转录（20%）", *_noted((20, 40, 60, 80, 100)), *_PROOFREAD_TAIL]
+
+
+@dataclass
+class MemoryCheckingProofreader(FakeProofreader):
+    """Notes, when proofreading starts, which transcription models are still in memory."""
+
+    engines: Engines | None = None
+    alive: list[list[bool]] = field(default_factory=list)
+
+    def proofread(self, text, model, checkpoint, on_progress):
+        gc.collect()
+        self.alive.append([ref() is not None for _, ref in self.engines.refs])
+        return super().proofread(text, model, checkpoint, on_progress)
+
+
+def _statuses_by_job():
+    seen: dict[str, list[str]] = {}
+    return seen, lambda job, text, fraction: seen.setdefault(job.job_id, []).append(text)
+
+
+@pytest.mark.parametrize(
+    ("plan", "has_gpu", "expected"),
+    [
+        (["ok"], lambda: True, "plain"),
+        (["ok"], lambda: False, "plain"),
+        (["load_fails"], lambda: True, "at_load"),
+        (["fails_after:1"], lambda: True, "after_first"),
+        (["ok"], _broken_driver, "at_load"),
+    ],
+    ids=["gpu-ok", "no-gpu", "gpu-load-fails", "gpu-fails-after-one", "driver-broken"],
+)
+def test_status_says_it_will_be_slower_from_the_moment_the_cpu_takes_over(tmp_path, quiet_logs, plan, has_gpu, expected):
+    expected = {"plain": PLAIN_STATUSES, "at_load": _fallback_at_load(), "after_first": _fallback_after_first_segment()}[expected]
+    store = JobStore(tmp_path / "state")
+    job = _job(tmp_path, store)
+    engines = Engines(plan)
+    proofreader = MemoryCheckingProofreader(engines=engines)
+    seen, on_status = _statuses_by_job()
+    _pipeline(store, WhisperTranscriber(engines, five_seconds, has_gpu), proofreader, on_status=on_status).run(job)
+    assert seen[job.job_id] == expected
+    assert store.load_all()[0].stage is Stage.DONE
+    assert job.txt_path.read_text(encoding="utf-8") == RAW
+    assert proofreader.alive and all(not any(alive) for alive in proofreader.alive)
+    if expected == PLAIN_STATUSES:
+        assert not any(word in text for text in seen[job.job_id] for word in ("CPU", "显卡", "慢"))
+
+
+def test_after_a_job_on_the_cpu_the_next_job_has_the_gpu_and_no_note(tmp_path, quiet_logs):
+    store = JobStore(tmp_path / "state")
+    first, second = _job(tmp_path, store, "第一课.mp3"), _job(tmp_path, store, "第二课.mp3")
+    engines = Engines(["load_fails", "ok"])
+    proofreader = MemoryCheckingProofreader(engines=engines)
+    seen, on_status = _statuses_by_job()
+    pipeline = _pipeline(store, WhisperTranscriber(engines, five_seconds, lambda: True), proofreader, on_status=on_status)
+    pipeline.run(first)
+    pipeline.run(second)
+    assert seen[first.job_id] == _fallback_at_load()
+    assert seen[second.job_id] == PLAIN_STATUSES
+    assert [job.stage for job in store.load_all()] == [Stage.DONE, Stage.DONE]
+    assert first.txt_path.read_text(encoding="utf-8") == second.txt_path.read_text(encoding="utf-8") == RAW
+    assert len(proofreader.alive) == 2 and all(not any(alive) for alive in proofreader.alive)
+
+
+def test_the_fallback_note_and_the_start_failure_say_what_happens_in_plain_words():
+    note, failed = flow.CPU_FALLBACK_NOTE, flow.MODEL_LOAD_FAILED.format(model="large-v3")
+    assert all(word in note for word in ("显卡", "CPU", "慢", "下一个任务"))
+    assert all(word in failed for word in ("large-v3", "内存", "重试"))
+    for text in (note, failed):
+        assert not any(word in text for word in ("CUDA", "显存", "驱动"))
+    assert "显卡" not in failed  # true on a computer without one as well
+
+
+def _stop_once_a_segment_is_saved(store, job):
+    return lambda: bool(read_segments(store.segments_path(job)))
+
+
+CUDA, CPU = ("large-v3", "cuda"), ("large-v3", "cpu")
+
+
+@pytest.mark.parametrize(
+    ("engines", "has_gpu", "stop", "stage", "loads", "kept"),
+    [
+        (lambda: Engines(["fails_after:2"], gpu_error=ValueError("bad")), True, False, Stage.FAILED, [CUDA], 2),
+        (lambda: Engines(["load_fails"], cpu="fails_after:1"), True, False, Stage.FAILED, [CUDA, CPU], 1),
+        (lambda: Engines(["load_fails"]), True, True, Stage.TRANSCRIBING, [CUDA, CPU], 1),
+        (lambda: Engines(["ok"], cpu="missing"), False, False, Stage.WAITING_MODEL, [CPU], 0),
+    ],
+    ids=["gpu-plain-error", "cpu-plain-error", "closing-on-cpu", "cpu-model-missing"],
+)
+def test_transcription_that_ends_badly_is_told_as_it_is_and_gives_the_model_back(
+    tmp_path, quiet_logs, engines, has_gpu, stop, stage, loads, kept
+):
+    store = JobStore(tmp_path / "state")
+    job = _job(tmp_path, store)
+    engines = engines()
+    should_stop = _stop_once_a_segment_is_saved(store, job) if stop else (lambda: False)
+    transcriber = WhisperTranscriber(engines, five_seconds, lambda: has_gpu, should_stop)
+    _pipeline(store, transcriber).run(job)
+    saved = store.load_all()[0]
+    assert saved.stage is stage
+    if stage is Stage.FAILED:
+        assert saved.message == GENERIC_FAILURE
+    if stage is Stage.WAITING_MODEL:
+        assert "large-v3" in saved.message
+    assert saved.message != flow.MODEL_LOAD_FAILED.format(model="large-v3")
+    assert engines.loads == loads  # a plain error on the GPU is no reason to use the CPU
+    assert [s.text for s in read_segments(store.segments_path(job))] == [f"第{i}句" for i in range(kept)]
+    assert bool(engines.refs) is (stage is not Stage.WAITING_MODEL)  # a model existed unless none could load
+    assert not any(engines.alive())
+
+
+def test_model_that_cannot_start_fails_retryably_and_retry_continues_where_it_stopped(tmp_path, quiet_logs):
+    store = JobStore(tmp_path / "state")
+    job = _job(tmp_path, store)
+    engines = Engines(["fails_after:2"], cpu="load_fails")
+    proofreader = FakeProofreader()
+    _pipeline(store, WhisperTranscriber(engines, five_seconds, lambda: True), proofreader).run(job)
+    failed = store.load_all()[0]
+    assert (failed.stage, failed.can_retry) == (Stage.FAILED, True)
+    assert failed.message == flow.MODEL_LOAD_FAILED.format(model="large-v3")
+    assert proofreader.calls == []
+    assert not job.txt_path.exists()
+    assert [s.text for s in read_segments(store.segments_path(job))] == ["第0句", "第1句"]
+    assert not any(engines.alive())
+
+    healthy = Engines(["ok"])
+    failed.stage = failed.retry_stage()
+    _pipeline(store, WhisperTranscriber(healthy, five_seconds, lambda: True)).run(failed)
+    final = store.load_all()[0]
+    assert final.stage is Stage.DONE
+    assert healthy.loads == [("large-v3", "cuda")]
+    assert healthy.seen_by("cuda") == [3.0]
+    assert final.txt_path.read_text(encoding="utf-8") == RAW
+
+
+def test_closed_while_on_the_cpu_restarts_on_the_gpu_without_repeating_or_missing(tmp_path, quiet_logs):
+    store = JobStore(tmp_path / "state")
+    job = _job(tmp_path, store)
+    dying = Engines(["fails_after:1"], cpu="fails_after:1", cpu_error=Crash())
+    with pytest.raises(Crash):
+        _pipeline(store, WhisperTranscriber(dying, five_seconds, lambda: True)).run(job)
+
+    restarted = store.load_all()[0]
+    healthy = Engines(["ok"])
+    seen, on_status = _statuses_by_job()
+    _pipeline(store, WhisperTranscriber(healthy, five_seconds, lambda: True), on_status=on_status).run(restarted)
+    final = store.load_all()[0]
+    assert final.stage is Stage.DONE
+    assert final.txt_path.read_text(encoding="utf-8") == RAW
+    assert healthy.loads == [("large-v3", "cuda")]
+    assert healthy.seen_by("cuda") == [3.0]
+    assert not any(flow.CPU_FALLBACK_NOTE in text for text in seen[restarted.job_id])
+    assert sorted(p.name for p in final.folder.iterdir()) == ["课.md", "课.txt"]

@@ -53,6 +53,9 @@ SOURCE_HELD = (
     "要转录的文件 {path} 暂时打不开（可能正被别的程序占用）。关掉占用它的程序，或等一会儿，再点“重试”。"
 )
 
+CPU_FALLBACK_NOTE = "显卡这次没能用上，改用电脑的处理器（CPU）转录，会慢一些；下一个任务会再试显卡。"
+MODEL_LOAD_FAILED = "转录模型 {model} 没能启动（可能电脑内存不够）。关掉占用内存多的程序后点“重试”；详情见日志。"
+
 
 class ModelMissing(Exception):
     """The transcription model is not on this computer; downloading needs consent."""
@@ -64,6 +67,10 @@ class ModelMissing(Exception):
 
 class NoAudio(Exception):
     """The audio cannot be read. The message is shown to the user as it is."""
+
+
+class EngineFailed(Exception):
+    """The transcription model could not start at all. The message is shown to the user as it is."""
 
 
 class ProofreadBlocked(Exception):
@@ -92,6 +99,11 @@ class Transcriber(Protocol):
     ) -> None: ...
 
     def release(self) -> None: ...
+
+    @property
+    def fell_back_to_cpu(self) -> bool:
+        """The current or last transcription moved to the CPU because the GPU could not be used."""
+        ...
 
 
 class Proofreader(Protocol):
@@ -132,7 +144,7 @@ class Pipeline:
             self._set(job, Stage.WAITING_MODEL, f"这台电脑上还没有转录模型 {exc.model}，下载后才能继续。")
         except ProofreadBlocked as exc:
             self._set(job, Stage.WAITING_PROOFREAD, str(exc))
-        except NoAudio as exc:
+        except (NoAudio, EngineFailed) as exc:
             self._set(job, Stage.FAILED, str(exc))
         except Exception:
             logger.exception("Job %s failed", job.job_id)
@@ -167,6 +179,12 @@ class Pipeline:
         self._set(job, Stage.TRANSCRIBING)
 
     def _transcribe(self, job: Job) -> None:
+        try:
+            self._transcribe_and_write(job)
+        finally:
+            self.transcriber.release()  # however it ended: one model at a time
+
+    def _transcribe_and_write(self, job: Job) -> None:
         checkpoint = self.store.segments_path(job)
         done = read_segments(checkpoint)
         job.message = ""
@@ -178,10 +196,8 @@ class Pipeline:
             segments = read_segments(checkpoint)
         if not segments:
             self._set(job, Stage.FAILED, "没有识别到说话的声音，所以没有生成文字稿。", can_retry=False)
-            self.transcriber.release()
             return
         job.txt_path = commit_new_text(job.txt_path, segments_to_text(segments))
-        self.transcriber.release()
         job.transcript_complete = True
         self._set(job, Stage.PROOFREADING)
 
@@ -191,7 +207,8 @@ class Pipeline:
         def on_progress(position: float, duration: float) -> None:
             fraction = min(position / duration, 1.0) if duration > 0 else None
             percent = f"（{fraction:.0%}）" if fraction is not None else ""
-            self.on_status(job, f"正在转录{percent}", fraction)
+            note = f"。{CPU_FALLBACK_NOTE}" if self.transcriber.fell_back_to_cpu else ""
+            self.on_status(job, f"正在转录{percent}{note}", fraction)
 
         self.transcriber.transcribe(
             job.audio_path,

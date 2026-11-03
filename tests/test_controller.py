@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import coursescribe.pipeline as flow
 from coursescribe.controller import SLEEP_WARNING, AppController
 from coursescribe.jobs import Job, JobStore, Stage
 from coursescribe.pipeline import (
@@ -28,13 +29,18 @@ from coursescribe.pipeline import (
 )
 from coursescribe.segments import Segment
 from coursescribe.settings import Settings, SettingsStore
+from coursescribe.transcribe import WhisperTranscriber
 from coursescribe.wavfile import repair_wav
+from test_pipeline import RAW
 from test_recording import _crashed_wav, _disk_full_during_repair, _held
+from test_transcribe import Engines, five_seconds
 
 NOW = datetime(2026, 11, 1, 19, 30)
 
 
 class FakeTranscriber:
+    fell_back_to_cpu = False
+
     def __init__(self):
         self.models = []
         self.missing = set()
@@ -140,11 +146,11 @@ class FakeKeepAwake:
 
 
 class Rig:
-    def __init__(self, tmp_path: Path, capture_fails=False):
+    def __init__(self, tmp_path: Path, capture_fails=False, transcriber=None):
         self.tmp_path = tmp_path
         self.store = JobStore(tmp_path / "state")
         self.settings = SettingsStore(tmp_path / "settings.json", Settings(tmp_path / "out", "large-v3", "model-a"))
-        self.transcriber = FakeTranscriber()
+        self.transcriber = transcriber or FakeTranscriber()
         self.proofreader = FakeProofreader()
         self.downloads = []
         self.download_error = None
@@ -1635,3 +1641,48 @@ def test_retrying_an_unsolved_transcript_problem_says_the_same_and_touches_nothi
         assert sorted(p.name for p in rig.store.folder.iterdir()) == sorted(
             [f"{job.job_id}.json", f"{job.job_id}.segments.jsonl"]
         )
+
+
+# --- the GPU cannot be used this time (docs/plans/M2-gpu-fallback-tests.md) ---
+
+
+def _transcription_statuses(statuses: list[str], start: int) -> list[str]:
+    """What the window showed from a job's "正在准备转录" until proofreading began."""
+    end = statuses.index("正在准备校对", start)
+    return statuses[start:end]
+
+
+def test_gpu_fallback_is_explained_for_that_file_only_and_the_next_file_has_the_gpu_again(tmp_path):
+    gate = threading.Event()
+    engines = Engines(["load_fails", "ok"], cpu_gate=gate)
+    rig = Rig(tmp_path, transcriber=WhisperTranscriber(engines, five_seconds, lambda: True))
+    try:
+        rig.controller.start()
+        rig.controller.add_files([rig.source("第一课.mp3")])
+        rig.wait(lambda: flow.CPU_FALLBACK_NOTE in rig.controller.state.status)
+        rig.controller.add_files([rig.source("第二课.mp3")])
+        during = rig.controller.state
+    finally:
+        gate.set()
+    rig.wait_idle()
+
+    assert flow.CPU_FALLBACK_NOTE in during.status and during.pending == 2
+    statuses = [state.status for state in rig.states]
+    starts = [i for i, text in enumerate(statuses) if text == "正在准备转录" and statuses[i - 1] != text]
+    assert len(starts) == 2
+    first = _transcription_statuses(statuses, starts[0])
+    from_cpu = first[next(i for i, text in enumerate(first) if text.startswith("正在转录（0%）")) :]
+    assert from_cpu and all(flow.CPU_FALLBACK_NOTE in text for text in from_cpu)
+    second = _transcription_statuses(statuses, starts[1])
+    assert any(text.startswith("正在转录") for text in second)
+    assert not any(flow.CPU_FALLBACK_NOTE in text for text in second)
+
+    final = rig.controller.state
+    assert final.status == "准备好了"
+    assert final.notice == "完成：第二课"
+    assert "CPU" not in final.notice and "显卡" not in final.notice
+    jobs = rig.store.load_all()
+    assert [job.stage for job in jobs] == [Stage.DONE, Stage.DONE]
+    assert all(job.txt_path.read_text(encoding="utf-8") == RAW for job in jobs)
+    assert engines.loads == [("large-v3", "cuda"), ("large-v3", "cpu"), ("large-v3", "cuda")]
+    rig.check_keep_awake_follows_busy()

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import gc
+import logging
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+import coursescribe.pipeline as flow
 from coursescribe.models import MODELS, model_size_label
 from coursescribe.pipeline import SOURCE_HELD, SOURCE_MISSING, ModelMissing, NoAudio, Stopped
 from coursescribe.transcribe import SAMPLE_RATE, WhisperTranscriber
@@ -336,3 +340,272 @@ def test_catalog_has_the_default_and_every_entry_states_its_size():
     assert all(size > 0 for size in MODELS.values())
     assert model_size_label("large-v3") == "约 3.1 GB"
     assert model_size_label("unknown-model") == "大小未知"
+
+
+# --- the GPU cannot be used this time (docs/plans/M2-gpu-fallback-tests.md) ---
+
+AUDIO_SECONDS = 5.0
+SCRIPT = [RawSegment(float(i), float(i + 1), f"第{i}句") for i in range(5)]
+EXPECTED = [(s.start, s.end, s.text) for s in SCRIPT]
+GPU_OUT_OF_MEMORY = "CUDA failed with error out of memory"  # measured on an RTX 5080, 2026-11-03
+GPU_FIRST_USE_FAILED = "cuBLAS failed with status CUBLAS_STATUS_ALLOC_FAILED"  # same day, same card
+
+
+def five_seconds(path):
+    return np.zeros(int(AUDIO_SECONDS) * SAMPLE_RATE, dtype=np.float32)
+
+
+class ScriptedModel:
+    """A loaded model that, like the real one, only knows the audio it is given."""
+
+    def __init__(self, script=SCRIPT, fail_after=None, error=None, gate=None, seen=None, device=""):
+        self.script = script
+        self.fail_after = fail_after
+        self.error = error
+        self.gate = gate
+        self.seen_seconds = None
+        self._seen = seen
+        self._device = device
+
+    def transcribe(self, audio, **options):
+        self.seen_seconds = len(audio) / SAMPLE_RATE
+        if self._seen is not None:
+            self._seen.append((self._device, self.seen_seconds))
+        offset = AUDIO_SECONDS - self.seen_seconds
+
+        def generate():
+            if self.gate is not None:
+                self.gate.wait(10)
+            given = 0
+            for piece in self.script:
+                if piece.start < offset:
+                    continue
+                if self.fail_after is not None and given >= self.fail_after:
+                    raise self.error
+                yield RawSegment(piece.start - offset, piece.end - offset, piece.text)
+                given += 1
+            if self.fail_after is not None:
+                raise self.error
+
+        return generate(), None
+
+
+def _fresh(error):
+    """A new copy, so a kept error's traceback (and the model in it) never outlives the test's model."""
+    return type(error)(*error.args)
+
+
+class Engines:
+    """Loads stand-in models onto the "GPU" or the "CPU": the engine and the graphics driver.
+
+    ``plan`` says what the GPU does at each load (the last entry repeats): ``ok``, ``load_fails``,
+    ``missing`` or ``fails_after:N``; ``cpu`` says the same for every CPU load.
+    """
+
+    def __init__(self, plan, cpu="ok", gpu_error=None, cpu_error=None, cpu_gate=None):
+        self.plan = list(plan)
+        self.cpu = cpu
+        self.gpu_error = gpu_error
+        self.cpu_error = cpu_error
+        self.cpu_gate = cpu_gate
+        self.loads: list[tuple[str, str]] = []
+        self.refs: list[tuple[str, weakref.ref]] = []
+        self.cuda_alive_at_cpu_load: list[bool] = []
+        self.seen: list[tuple[str, float]] = []
+        self._gpu_loads = 0
+
+    def __call__(self, name, device):
+        self.loads.append((name, device))
+        if device == "cuda":
+            behaviour = self.plan[min(self._gpu_loads, len(self.plan) - 1)]
+            self._gpu_loads += 1
+        else:
+            gc.collect()
+            self.cuda_alive_at_cpu_load.append(any(ref() is not None for kind, ref in self.refs if kind == "cuda"))
+            behaviour = self.cpu
+        if behaviour == "missing":
+            raise ModelMissing(name)
+        if behaviour == "load_fails":
+            raise RuntimeError(GPU_OUT_OF_MEMORY if device == "cuda" else "bad allocation")
+        fail_after = error = None
+        if behaviour.startswith("fails_after:"):
+            fail_after = int(behaviour.split(":")[1])
+            if device == "cpu":
+                error = _fresh(self.cpu_error) if self.cpu_error is not None else ValueError("bad")
+            elif self.gpu_error is not None:
+                error = _fresh(self.gpu_error)
+            else:
+                error = RuntimeError(GPU_FIRST_USE_FAILED if fail_after == 0 else GPU_OUT_OF_MEMORY)
+        gate = self.cpu_gate if device == "cpu" else None
+        model = ScriptedModel(fail_after=fail_after, error=error, gate=gate, seen=self.seen, device=device)
+        self.refs.append((device, weakref.ref(model)))
+        return model
+
+    def alive(self) -> list[bool]:
+        gc.collect()
+        return [ref() is not None for _, ref in self.refs]
+
+    def seen_by(self, device) -> list[float]:
+        return [seconds for kind, seconds in self.seen if kind == device]
+
+
+@pytest.fixture
+def quiet_logs(monkeypatch):
+    """Kept log records hold the exception, and through it the model; these tests check memory."""
+    for name in ("coursescribe.pipeline", "coursescribe.transcribe"):
+        monkeypatch.setattr(logging.getLogger(name), "disabled", True)
+
+
+def _broken_driver():
+    raise RuntimeError("CUDA driver version is insufficient")
+
+
+def gpu_transcriber(engines, has_gpu=lambda: True, **kwargs):
+    return WhisperTranscriber(load_model=engines, decode=five_seconds, has_gpu=has_gpu, **kwargs)
+
+
+def _texts(transcriber, start_at=0.0, model="large-v3", into=None):
+    segments = into if into is not None else []
+    transcriber.transcribe(AUDIO, model, start_at, segments.append, lambda p, d: None)
+    return [(s.start, s.end, s.text) for s in segments]
+
+
+@pytest.mark.parametrize("first", ["load_fails", "fails_after:2"])
+@pytest.mark.parametrize("release_between", [True, False], ids=["released", "kept"])
+def test_gpu_failure_in_one_job_does_not_keep_the_next_job_on_the_cpu(first, release_between):
+    engines = Engines([first, "ok"])
+    transcriber = gpu_transcriber(engines)
+    assert _texts(transcriber) == EXPECTED
+    assert (transcriber.fell_back_to_cpu, transcriber.device) == (True, "cpu")
+    if release_between:
+        transcriber.release()
+    assert _texts(transcriber) == EXPECTED
+    assert (transcriber.fell_back_to_cpu, transcriber.device) == (False, "cuda")
+    assert engines.loads == [("large-v3", "cuda"), ("large-v3", "cpu"), ("large-v3", "cuda")]
+
+
+@pytest.mark.parametrize(
+    ("gpu", "start_at", "devices", "gpu_segments", "fell_back"),
+    [
+        ("ok", 0.0, ["cuda"], 5, False),
+        ("load_fails", 0.0, ["cuda", "cpu"], 0, True),
+        ("fails_after:0", 0.0, ["cuda", "cpu"], 0, True),
+        ("fails_after:2", 0.0, ["cuda", "cpu"], 2, True),
+        ("fails_after:5", 0.0, ["cuda"], 5, False),
+        ("fails_after:1", 2.0, ["cuda", "cpu"], 1, True),
+        ("driver_broken", 0.0, ["cpu"], 0, True),
+    ],
+)
+def test_output_is_the_same_wherever_the_gpu_fails_and_it_is_tried_once_per_job(
+    quiet_logs, gpu, start_at, devices, gpu_segments, fell_back
+):
+    reference = _texts(gpu_transcriber(Engines(["ok"]), has_gpu=lambda: False), start_at)
+    assert reference == EXPECTED[int(start_at) :]
+    engines = Engines(["ok"] if gpu == "driver_broken" else [gpu])
+    transcriber = gpu_transcriber(engines, _broken_driver if gpu == "driver_broken" else lambda: True)
+    for _ in range(3):
+        got = _texts(transcriber, start_at)
+        assert got == reference
+        assert [start for start, _, _ in got] == sorted(start for start, _, _ in got)
+        assert transcriber.fell_back_to_cpu is fell_back
+        transcriber.release()
+    assert engines.loads == [("large-v3", device) for device in devices] * 3
+    if "cpu" in devices:
+        assert engines.seen_by("cpu") == [AUDIO_SECONDS - start_at - gpu_segments] * 3
+    assert engines.cuda_alive_at_cpu_load == [False] * devices.count("cpu") * 3
+
+
+def test_model_missing_on_the_gpu_is_not_a_gpu_failure():
+    engines = Engines(["missing"])
+    transcriber = gpu_transcriber(engines)
+    with pytest.raises(ModelMissing) as caught:
+        _texts(transcriber)
+    assert not isinstance(caught.value, flow.EngineFailed)
+    assert caught.value.model == "large-v3"
+    assert engines.loads == [("large-v3", "cuda")]
+    assert transcriber.fell_back_to_cpu is False
+
+
+@pytest.mark.parametrize(
+    ("has_gpu", "gpu", "model", "loads"),
+    [
+        (lambda: True, "fails_after:2", "large-v3", [("large-v3", "cuda"), ("large-v3", "cpu")]),
+        (lambda: False, "ok", "medium", [("medium", "cpu")]),
+    ],
+    ids=["gpu-then-cpu", "no-gpu"],
+)
+def test_model_that_cannot_start_on_the_cpu_says_so_and_holds_no_memory(quiet_logs, has_gpu, gpu, model, loads):
+    engines = Engines([gpu], cpu="load_fails")
+    transcriber = gpu_transcriber(engines, has_gpu)
+    with pytest.raises(flow.EngineFailed) as caught:
+        _texts(transcriber, model=model)
+    message = str(caught.value)
+    assert message == flow.MODEL_LOAD_FAILED.format(model=model)
+    assert model in message and "内存" in message and "重试" in message
+    assert "bad allocation" not in message and "CUDA" not in message
+    assert engines.loads == loads
+    assert transcriber.fell_back_to_cpu is False  # no CPU model ever ran
+    del caught
+    assert len(engines.alive()) == loads.count(("large-v3", "cuda"))  # the GPU model existed, and is gone
+    assert not any(engines.alive())
+
+
+def test_model_missing_on_the_cpu_is_reported_as_missing_not_as_failed():
+    engines = Engines(["ok"], cpu="missing")
+    with pytest.raises(ModelMissing) as caught:
+        _texts(gpu_transcriber(engines, has_gpu=lambda: False))
+    assert not isinstance(caught.value, flow.EngineFailed)
+    assert engines.loads == [("large-v3", "cpu")]
+
+
+def test_stop_request_on_the_cpu_after_a_gpu_failure_still_stops():
+    seen = []
+    transcriber = gpu_transcriber(Engines(["load_fails"]), should_stop=lambda: len(seen) >= 1)
+    with pytest.raises(Stopped) as caught:
+        _texts(transcriber, into=seen)
+    assert not isinstance(caught.value, flow.EngineFailed)
+    assert [s.text for s in seen] == ["第0句"]
+
+
+def test_other_errors_on_the_cpu_after_a_gpu_failure_are_not_called_a_start_failure():
+    seen = []
+    transcriber = gpu_transcriber(Engines(["load_fails"], cpu="fails_after:1"))
+    with pytest.raises(ValueError) as caught:
+        _texts(transcriber, into=seen)
+    assert not isinstance(caught.value, flow.EngineFailed)
+    assert [s.text for s in seen] == ["第0句"]
+
+
+def test_a_failing_save_is_not_mistaken_for_a_gpu_failure_even_when_the_path_says_cuda():
+    engines = Engines(["ok"])
+    transcriber = gpu_transcriber(engines)
+    saved = []
+
+    def save(segment):
+        if saved:
+            raise OSError(28, "No space left on device", r"D:\课程\CUDA编程第一课\segments.jsonl")
+        saved.append(segment)
+
+    with pytest.raises(OSError) as caught:
+        transcriber.transcribe(AUDIO, "large-v3", 0.0, save, lambda p, d: None)
+    assert caught.value.errno == 28
+    assert [s.text for s in saved] == ["第0句"]
+    assert engines.loads == [("large-v3", "cuda")]
+    assert transcriber.fell_back_to_cpu is False
+
+
+def test_a_driver_that_stops_answering_drops_the_kept_gpu_model_before_the_cpu_one_loads(quiet_logs):
+    engines = Engines(["ok"])
+    answers = iter([True, "broken"])
+
+    def has_gpu():
+        if next(answers) == "broken":
+            raise RuntimeError("CUDA driver version is insufficient")
+        return True
+
+    transcriber = gpu_transcriber(engines, has_gpu)
+    assert _texts(transcriber) == EXPECTED  # no release afterwards: the GPU model stays loaded
+    assert _texts(transcriber) == EXPECTED
+    assert transcriber.fell_back_to_cpu is True
+    assert engines.loads == [("large-v3", "cuda"), ("large-v3", "cpu")]
+    assert engines.cuda_alive_at_cpu_load == [False]

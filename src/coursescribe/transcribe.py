@@ -9,7 +9,15 @@ from collections.abc import Callable
 from pathlib import Path
 
 from coursescribe.files import _patiently
-from coursescribe.pipeline import SOURCE_HELD, SOURCE_MISSING, ModelMissing, NoAudio, Stopped
+from coursescribe.pipeline import (
+    MODEL_LOAD_FAILED,
+    SOURCE_HELD,
+    SOURCE_MISSING,
+    EngineFailed,
+    ModelMissing,
+    NoAudio,
+    Stopped,
+)
 from coursescribe.segments import Segment
 
 logger = logging.getLogger(__name__)
@@ -67,6 +75,8 @@ def _is_gpu_failure(error: Exception) -> bool:
 
 
 class WhisperTranscriber:
+    """Each call tries the GPU once; if it fails, the rest of that call runs on the CPU."""
+
     def __init__(
         self,
         load_model: Callable = load_whisper,
@@ -80,8 +90,14 @@ class WhisperTranscriber:
         self._should_stop = should_stop
         self._model = None
         self._model_name: str | None = None
-        self.device: str | None = None
-        self._gpu_failed = False
+        self.device: str | None = None  # where the last model that loaded runs; kept after release()
+        self._fell_back = False
+        self._caller_failed = False
+
+    @property
+    def fell_back_to_cpu(self) -> bool:
+        """True when this call moved to the CPU because the GPU could not be used."""
+        return self._fell_back
 
     def release(self) -> None:
         """Give back the model's memory, so proofreading can have the GPU."""
@@ -89,25 +105,23 @@ class WhisperTranscriber:
         self._model_name = None
         gc.collect()
 
-    def _ensure_model(self, name: str):
-        if self._model is not None and self._model_name == name:
+    def _ensure_model(self, name: str, device: str):
+        if self._model is not None and self._model_name == name and self.device == device:
             return self._model
-        self.release()
-        if self._has_gpu() and not self._gpu_failed:
-            try:
-                self._model = self._load_model(name, "cuda")
-                self.device = "cuda"
-            except ModelMissing:
-                raise
-            except Exception as exc:
-                logger.warning("GPU model load failed, using the CPU: %s", exc)
-                self._gpu_failed = True
-        if self._model is None:
-            self._model = self._load_model(name, "cpu")
-            self.device = "cpu"
+        self.release()  # a model kept from a GPU failure is dropped here, so the GPU is tried again
+        self._model = self._load_model(name, device)
+        self.device = device
         self._model_name = name
-        logger.info("Transcription model %s on %s", name, self.device)
+        logger.info("Transcription model %s on %s", name, device)
         return self._model
+
+    def _gpu_present(self) -> bool | None:
+        """What the driver says; None when asking it failed, which counts as a GPU failure."""
+        try:
+            return bool(self._has_gpu())
+        except Exception as exc:
+            logger.warning("Could not ask the graphics driver about the GPU, using the CPU: %s", str(exc))
+            return None
 
     def _decode_or_say_why(self, path: Path):
         try:
@@ -146,26 +160,58 @@ class WhisperTranscriber:
         on_segment: Callable[[Segment], None],
         on_progress: Callable[[float, float], None],
     ) -> None:
+        self._fell_back = False
         samples = self._read_audio(audio)
         duration = len(samples) / SAMPLE_RATE
+        if start_at >= duration:
+            return
         position = start_at
-        while position < duration:
-            engine = self._ensure_model(model)
-            try:
-                self._run(engine, samples, position, duration, on_segment, on_progress)
+        gpu = self._gpu_present()
+        if gpu:
+            position = self._transcribe_on_gpu(model, samples, position, duration, on_segment, on_progress)
+            if position is None:
                 return
-            except (Stopped, ModelMissing):
+            self.release()  # the broken GPU model goes before the CPU one is loaded
+            if position >= duration:
+                return  # the GPU had given everything before it failed
+        engine = self._load_on_cpu(model)
+        if gpu is not False:
+            self._fell_back = True
+            on_progress(position, duration)  # so the note shows now, not after the first slow segment
+        self._run(engine, samples, position, duration, on_segment, on_progress)
+
+    def _transcribe_on_gpu(self, model, samples, start_at, duration, on_segment, on_progress) -> float | None:
+        """None when the GPU did it all; otherwise where the CPU has to continue."""
+        try:
+            engine = self._ensure_model(model, "cuda")
+        except ModelMissing:
+            raise
+        except Exception as exc:
+            logger.warning("GPU model load failed, using the CPU: %s", str(exc))
+            return start_at
+        try:
+            self._run(engine, samples, start_at, duration, on_segment, on_progress)
+            return None
+        except (Stopped, ModelMissing):
+            raise
+        except Exception as exc:
+            if self._caller_failed or not _is_gpu_failure(exc):
                 raise
-            except Exception as exc:
-                if self.device != "cuda" or not _is_gpu_failure(exc):
-                    raise
-                logger.warning("GPU failed while transcribing, continuing on the CPU: %s", exc)
-                self._gpu_failed = True
-                self.release()
-                position = max(position, self._last_end)
+            logger.warning("GPU failed while transcribing, continuing on the CPU: %s", str(exc))
+        return max(start_at, self._last_end)
+
+    def _load_on_cpu(self, model: str):
+        try:
+            return self._ensure_model(model, "cpu")
+        except ModelMissing:
+            raise
+        except Exception as exc:
+            logger.error("Transcription model %s could not start on the CPU", model, exc_info=True)
+            raise EngineFailed(MODEL_LOAD_FAILED.format(model=model)) from exc
 
     def _run(self, engine, samples, start_at, duration, on_segment, on_progress) -> None:
         self._last_end = start_at
+        self._caller_failed = False
         pieces, _ = engine.transcribe(
             samples[int(start_at * SAMPLE_RATE) :],
             language="zh",
@@ -176,8 +222,12 @@ class WhisperTranscriber:
         )
         for piece in pieces:
             segment = Segment(piece.start + start_at, piece.end + start_at, piece.text.strip())
-            on_segment(segment)
-            self._last_end = segment.end
-            on_progress(segment.end, duration)
+            try:
+                on_segment(segment)
+                self._last_end = segment.end
+                on_progress(segment.end, duration)
+            except Exception:
+                self._caller_failed = True  # e.g. a full disk; its path may say "CUDA" without the GPU being at fault
+                raise
             if self._should_stop():
                 raise Stopped
