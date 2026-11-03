@@ -14,6 +14,7 @@ from typing import Protocol
 from coursescribe.files import UnknownEncoding, commit_new_text, read_transcript
 from coursescribe.jobs import Job, JobStore, Stage
 from coursescribe.segments import Segment, append_segment, read_segments, segments_to_text
+from coursescribe.vocabulary import WordListUnreadable
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,7 @@ class Pipeline:
             self._set(job, Stage.WAITING_MODEL, f"这台电脑上还没有转录模型 {exc.model}，下载后才能继续。")
         except ProofreadBlocked as exc:
             self._set(job, Stage.WAITING_PROOFREAD, str(exc))
-        except (NoAudio, EngineFailed) as exc:
+        except (NoAudio, EngineFailed, WordListUnreadable) as exc:
             self._set(job, Stage.FAILED, str(exc))
         except Exception:
             logger.exception("Job %s failed", job.job_id)
@@ -254,8 +255,12 @@ class Pipeline:
             result = self.proofreader.proofread(
                 text, job.proofread_model, self.store.proofread_path(job), on_progress
             )
-        finally:
+        except WordListUnreadable:
+            raise  # refused before the service was asked anything: there is no model to release
+        except BaseException:
             self.proofreader.release(job.proofread_model)
+            raise
+        self.proofreader.release(job.proofread_model)
         job.md_path = commit_new_text(job.md_path, f"# {job.md_path.stem}\n\n{result.markdown}")
         job.unproofread_chunks = result.unproofread_chunks
         job.total_chunks = result.total_chunks

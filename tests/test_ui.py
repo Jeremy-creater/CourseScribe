@@ -374,3 +374,73 @@ class TestWordList:
         )
         dialog.word_list_button.click()
         assert opened == [path] and path.read_text(encoding="utf-8") == "践行\n"
+
+    def test_an_existing_gbk_word_list_is_opened_byte_for_byte_untouched(self, tmp_path, qt_app):
+        opened = []
+        path = tmp_path / "词表.txt"
+        path.write_bytes("践行\r\n见行 → 践行\r\n".encode("gbk"))
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        dialog = SettingsDialog(
+            Settings(tmp_path, "large-v3", "model-a"), ["model-a"], choose_folder=lambda: None,
+            word_list=path, open_file=opened.append,
+        )
+        dialog.word_list_button.click()
+        assert opened == [path]
+        assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+
+    def test_a_word_list_that_cannot_be_created_is_explained_and_not_opened(self, tmp_path, qt_app, monkeypatch):
+        from coursescribe.vocabulary import WORD_LIST_CREATE_FAILED
+
+        def no_space(descriptor):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("coursescribe.files.os.fsync", no_space)
+        opened = []
+        path = tmp_path / "home" / "词表.txt"
+        dialog = SettingsDialog(
+            Settings(tmp_path, "large-v3", "model-a"), ["model-a"], choose_folder=lambda: None,
+            word_list=path, open_file=opened.append,
+        )
+        dialog.word_list_button.click()
+        assert opened == []
+        assert dialog.word_note.text() == WORD_LIST_CREATE_FAILED.format(path=path)
+        assert not path.exists()
+        assert not path.parent.exists() or list(path.parent.iterdir()) == []
+
+    def test_a_folder_where_the_word_list_should_be_is_explained_and_not_opened(self, tmp_path, qt_app):
+        from coursescribe.vocabulary import WORD_LIST_UNREADABLE
+
+        opened = []
+        path = tmp_path / "词表.txt"
+        path.mkdir()
+        dialog = SettingsDialog(
+            Settings(tmp_path, "large-v3", "model-a"), ["model-a"], choose_folder=lambda: None,
+            word_list=path, open_file=opened.append,
+        )
+        dialog.word_list_button.click()
+        assert opened == []
+        assert dialog.word_note.text() == WORD_LIST_UNREADABLE.format(path=path)
+        assert path.is_dir() and list(path.iterdir()) == []
+
+    def test_the_note_wraps_and_returns_to_normal_once_the_word_list_opens(self, tmp_path, qt_app, monkeypatch):
+        from coursescribe.vocabulary import TEMPLATE, WORD_LIST_CREATE_FAILED
+
+        def no_space(descriptor):
+            raise OSError(28, "No space left on device")
+
+        opened = []
+        path = tmp_path / "词表.txt"
+        dialog = SettingsDialog(
+            Settings(tmp_path, "large-v3", "model-a"), ["model-a"], choose_folder=lambda: None,
+            word_list=path, open_file=opened.append,
+        )
+        usual = dialog.word_note.text()
+        assert dialog.word_note.wordWrap()
+        monkeypatch.setattr("coursescribe.files.os.fsync", no_space)
+        dialog.word_list_button.click()
+        assert dialog.word_note.text() == WORD_LIST_CREATE_FAILED.format(path=path) != usual
+        monkeypatch.undo()
+        dialog.word_list_button.click()
+        assert opened == [path]
+        assert path.read_text(encoding="utf-8") == TEMPLATE
+        assert dialog.word_note.text() == usual

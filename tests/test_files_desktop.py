@@ -11,6 +11,7 @@ import pytest
 from coursescribe.files import read_transcript
 from coursescribe.pipeline import SOURCE_HELD, NoAudio
 from coursescribe.platform import FILES_CAN_BE_HELD
+from coursescribe.vocabulary import WORD_LIST_HELD, Vocabulary, WordListUnreadable, load_vocabulary
 from helpers import hold_without_sharing
 from test_recording_desktop import _wait_until_readable
 
@@ -35,6 +36,29 @@ def test_transcript_read_waits_out_a_short_real_hold_and_reports_a_long_one(tmp_
         _wait_until_readable(transcript, 5.0)
     assert read_transcript(transcript) == "第一课的内容\n第二句\n"
     assert transcript.read_bytes() == data
+
+
+def test_word_list_read_waits_out_a_short_real_hold_and_reports_a_long_one(tmp_path):
+    """M2 item 11 (G1): the stand-in for a held word list matches a real Windows hold."""
+    data = "见行 → 践行\r\n".encode("gbk")
+    word_list = tmp_path / "词表.txt"
+    word_list.write_bytes(data)
+    expected = Vocabulary((), (("见行", "践行"),))
+
+    hold_without_sharing(word_list, 0.3)
+    assert load_vocabulary(word_list) == expected
+    _wait_until_readable(word_list, 5.0)
+
+    hold_without_sharing(word_list, 3.0)
+    if FILES_CAN_BE_HELD:
+        started = time.monotonic()
+        with pytest.raises(WordListUnreadable) as caught:
+            load_vocabulary(word_list)
+        assert str(caught.value) == WORD_LIST_HELD.format(path=word_list)
+        assert time.monotonic() - started < 2
+        _wait_until_readable(word_list, 5.0)
+    assert load_vocabulary(word_list) == expected
+    assert word_list.read_bytes() == data
 
 
 @pytest.mark.engine

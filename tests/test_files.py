@@ -328,3 +328,16 @@ def test_transcript_on_an_unplugged_drive_is_reported_at_once(tmp_path, monkeypa
     assert held.attempts == 1  # not a hold, so no waiting
     held.release()
     assert path.read_bytes() == data
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [(b"a\x0cb\n", "a\x0cb\n"), (b"\xd1\xa7\xcf\xb0\n", "ѧϰ\n")],
+    ids=["control-character-kept", "gbk-that-is-valid-utf-8-not-reread"],
+)
+def test_transcripts_keep_their_own_rules_beside_the_word_list(tmp_path, data, expected):
+    """M2 item 11 (T0): the word list's stricter decoding does not reach transcripts."""
+    path = tmp_path / "t.txt"
+    path.write_bytes(data)
+    assert read_transcript(path) == expected
+    assert path.read_bytes() == data

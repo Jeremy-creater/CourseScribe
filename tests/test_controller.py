@@ -146,12 +146,12 @@ class FakeKeepAwake:
 
 
 class Rig:
-    def __init__(self, tmp_path: Path, capture_fails=False, transcriber=None):
+    def __init__(self, tmp_path: Path, capture_fails=False, transcriber=None, proofreader=None):
         self.tmp_path = tmp_path
         self.store = JobStore(tmp_path / "state")
         self.settings = SettingsStore(tmp_path / "settings.json", Settings(tmp_path / "out", "large-v3", "model-a"))
         self.transcriber = transcriber or FakeTranscriber()
-        self.proofreader = FakeProofreader()
+        self.proofreader = proofreader or FakeProofreader()
         self.downloads = []
         self.download_error = None
         self.states = []
@@ -1686,3 +1686,71 @@ def test_gpu_fallback_is_explained_for_that_file_only_and_the_next_file_has_the_
     assert all(job.txt_path.read_text(encoding="utf-8") == RAW for job in jobs)
     assert engines.loads == [("large-v3", "cuda"), ("large-v3", "cpu"), ("large-v3", "cuda")]
     rig.check_keep_awake_follows_busy()
+
+
+# --- M2 item 11: an unreadable word list (docs/plans/M2-vocabulary-tests.md) ---
+
+
+def test_an_unreadable_word_list_fails_for_retry_says_the_same_each_time_and_finishes_once_fixed(tmp_path):
+    from coursescribe.ollama import OllamaClient
+    from coursescribe.proofread import BREAK_MARKER, TEXT_MARKER, OllamaProofreader
+    from coursescribe.vocabulary import WORD_LIST_ENCODING, load_vocabulary
+    from fake_ollama import FakeOllama
+
+    word_list = tmp_path / "词表.txt"
+    word_list.write_bytes("caf\xe9 -> Caf\xe9".encode("latin-1"))
+    fake = FakeOllama(lambda p: "无" if BREAK_MARKER in p else p.rsplit(TEXT_MARKER, 1)[1] + "。")
+
+    def proofreader():
+        client = OllamaClient(fake.url, timeout=0.5, unload_timeout=0.5)
+        return OllamaProofreader(client, retry_pause=0, vocabulary=lambda: load_vocabulary(word_list))
+
+    expected_notice = f"第一课：{WORD_LIST_ENCODING.format(path=word_list)}"
+
+    def assert_failed(rig, txt):
+        jobs = rig.store.load_all()
+        assert len(jobs) == 1
+        job = jobs[0]
+        state = rig.controller.state
+        assert job.stage is Stage.FAILED and job.offers_retry and job.attempts == 0
+        assert (state.failed, state.waiting_proofread, state.pending) == (1, 0, 0)
+        assert state.notice == expected_notice
+        assert "Ollama" not in state.notice and "处理时出错了" not in state.notice
+        assert list(job.folder.glob("*.md")) == []
+        assert _snapshot(job.txt_path) == txt
+        return job
+
+    try:
+        first = Rig(tmp_path, proofreader=proofreader())
+        first.controller.start()
+        first.controller.add_files([first.source("第一课.mp3")])
+        first.wait_idle()
+        job = first.store.load_all()[0]
+        txt = _snapshot(job.txt_path)
+        assert_failed(first, txt)
+        for _ in range(3):
+            first.controller.retry_failed()
+            first.wait_idle()
+            assert_failed(first, txt)
+        first.check_keep_awake_follows_busy()  # shuts it down
+
+        asked = len(fake.log)
+        again = Rig(tmp_path, proofreader=proofreader())
+        again.controller.start()
+        again.wait_idle()
+        job = again.store.load_all()[0]
+        assert job.stage is Stage.FAILED and again.controller.state.failed == 1
+        assert len(fake.log) == asked
+
+        word_list.write_bytes("见行 → 践行\n".encode("utf-8"))
+        again.controller.retry_failed()
+        again.wait_idle()
+        final = again.store.load_all()
+        assert len(final) == 1 and final[0].stage is Stage.DONE
+        state = again.controller.state
+        assert state.failed == 0 and state.notice == "完成：第一课" and state.status == "准备好了"
+        assert _snapshot(final[0].txt_path) == txt
+        assert sorted(p.name for p in final[0].folder.iterdir()) == ["第一课.md", "第一课.txt"]
+        again.check_keep_awake_follows_busy()
+    finally:
+        fake.close()

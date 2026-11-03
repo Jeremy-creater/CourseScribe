@@ -33,7 +33,7 @@ from coursescribe.proofread import (
     parse_breaks,
 )
 from coursescribe.text import content_chars
-from coursescribe.vocabulary import parse_vocabulary
+from coursescribe.vocabulary import WORD_LIST_ENCODING, WordListUnreadable, load_vocabulary, parse_vocabulary
 from fake_ollama import FakeOllama, Reply
 
 SOURCE = "今天我们讲数据库索引\n索引可以让查询变快\n但是写入会变慢一点\n"
@@ -843,6 +843,163 @@ class TestResumingGivesTheSameResult:
         result = _run(_proofreader(fake, chunk_chars=100), THREE, tmp_path / "c.json")
         assert result.markdown == baseline
         assert result.unproofread_chunks == 0
+
+
+# --- M2 item 11: the word list during proofreading (docs/plans/M2-vocabulary-tests.md) ---
+
+LATIN_1_WORD_LIST = "café -> Café".encode("latin-1")
+
+
+def _word_list_file(tmp_path, content: str, encoding: str = "utf-8"):
+    path = tmp_path / "词表.txt"
+    path.write_bytes(content.encode(encoding))
+    return path
+
+
+def _reading(word_list, reads=None):
+    def read():
+        if reads is not None:
+            reads.append(1)
+        return load_vocabulary(word_list)
+
+    return read
+
+
+def _prompt_head(prompt: str) -> str:
+    return prompt.split(TEXT_MARKER)[0]
+
+
+class TestWordListInProofreading:
+    @pytest.mark.parametrize(
+        ("word_list", "text", "reply", "markdown", "sent"),
+        [
+            ("行 → 践行\n", "我们要行动\n", None, "我们要践行动。\n", "我们要践行动"),
+            ("A → B\nB → C\n", "用A和B\n", None, "用B和C。\n", "用B和C"),
+            ("见行 → 践行\n", "我们讲见行\n", None, "我们讲践行。\n", "我们讲践行"),
+            ("见行 → 践行\n", "我们讲见行\n", "我们讲见行。", "我们讲践行。\n", "我们讲践行"),
+            ("见行 → 践行\n", "我们讲见\n行很重要\n", None, "我们讲践行很重要。\n", "我们讲践行很重要"),
+            ("见行 → 践行\n", "我们讲见嗯行很重要\n", None, "我们讲践行很重要。\n", "我们讲践行很重要"),
+        ],
+        ids=["fix-contains-word", "chain", "plain", "model-undoes", "split-by-line", "split-by-filler"],
+    )
+    def test_a_fix_takes_effect_once_and_finds_words_split_by_lines_or_fillers(
+        self, service, tmp_path, word_list, text, reply, markdown, sent
+    ):
+        fake = service(echo_with_stop if reply is None else (lambda p: "无" if BREAK_MARKER in p else reply))
+        path = _word_list_file(tmp_path, word_list)
+        result = _proofreader(fake, vocabulary=_reading(path)).proofread(
+            text, "model-a", tmp_path / "c.json", lambda d, t: None
+        )
+        assert result.markdown == markdown
+        assert chunk_of(fake.prompts[0]) == sent
+
+    @pytest.mark.parametrize("text", ["我们讲见\n行很重要\n", "我们讲见嗯行很重要\n"], ids=["line", "filler"])
+    def test_a_chunk_the_model_fails_keeps_the_fixed_words(self, service, tmp_path, text):
+        def respond(prompt):
+            if BREAK_MARKER in prompt:
+                return "无"
+            return "完全不同的一段话。" if "践行" in chunk_of(prompt) else chunk_of(prompt) + "。"
+
+        fake = service(respond)
+        path = _word_list_file(tmp_path, "见行 → 践行\n")
+        result = _proofreader(fake, chunk_chars=10, vocabulary=_reading(path)).proofread(
+            text + "另外一段内容在这里\n", "model-a", tmp_path / "c.json", lambda d, t: None
+        )
+        assert result.unproofread_chunks == 1
+        assert result.markdown.count("践行") == 1
+        assert "见行" not in result.markdown and "嗯" not in result.markdown
+
+    @pytest.mark.parametrize("when", ["first-chunk", "model-list"])
+    def test_a_word_list_edited_during_proofreading_applies_from_the_next_task(self, service, tmp_path, when):
+        path = _word_list_file(tmp_path, "见行 → 践行\n")
+        edited = "见行 → 建行\n".encode("gbk")
+
+        def edit():
+            path.write_bytes(edited)
+
+        def respond(prompt):
+            if BREAK_MARKER in prompt:
+                return "无"
+            if when == "first-chunk":
+                edit()
+            return chunk_of(prompt) + "。"
+
+        def tags():
+            if when == "model-list":
+                edit()
+            return Reply()
+
+        fake = service(respond, tags_reply=tags)
+        reads = []
+        reader = _proofreader(fake, chunk_chars=100, vocabulary=_reading(path, reads))
+        text = ("这一段讲见行的道理。\n" * 8) * 3
+        heard = text.count("见行")
+
+        first = reader.proofread(text, "model-a", tmp_path / "1.json", lambda d, t: None)
+        assert len(reads) == 1
+        assert first.markdown.count("践行") == heard and "建行" not in first.markdown
+        polished = polish_prompts(fake)
+        assert len(polished) == first.total_chunks > 1
+        assert all("践行" in _prompt_head(p) and "建行" not in _prompt_head(p) for p in polished)
+        assert all("建行" not in chunk_of(p) for p in polished)
+
+        second = reader.proofread(text, "model-a", tmp_path / "2.json", lambda d, t: None)
+        assert len(reads) == 2
+        assert second.markdown.count("建行") == heard and "践行" not in second.markdown
+        assert "建行" in _prompt_head(polish_prompts(fake)[-1])
+        assert path.read_bytes() == edited
+
+    @pytest.mark.parametrize(
+        ("change", "redone_all", "word"),
+        [("new-fix", True, "建行"), ("saved-as-gbk", False, "践行")],
+    )
+    def test_resuming_after_the_word_list_changed_uses_one_word_list_for_the_whole_md(
+        self, service, tmp_path, change, redone_all, word
+    ):
+        text = "第一段讲见行。\n" * 40
+        checkpoint = tmp_path / "c.json"
+        path = _word_list_file(tmp_path, "见行 → 践行\n")
+
+        class DyingClient(OllamaClient):
+            calls = 0
+
+            def generate(self, model, prompt):
+                DyingClient.calls += 1
+                if DyingClient.calls == 3:
+                    raise OllamaDown("connection lost")
+                return super().generate(model, prompt)
+
+        with pytest.raises(ProofreadBlocked):
+            OllamaProofreader(DyingClient(service().url), chunk_chars=100, vocabulary=_reading(path)).proofread(
+                text, "model-a", checkpoint, lambda d, t: None
+            )
+        if change == "new-fix":
+            path.write_bytes("见行 → 建行\n".encode("utf-8"))
+        else:
+            path.write_bytes("见行 → 践行\n".encode("gbk"))
+
+        fresh = service()
+        result = _proofreader(fresh, chunk_chars=100, vocabulary=_reading(path)).proofread(
+            text, "model-a", checkpoint, lambda d, t: None
+        )
+        asked = len(polish_prompts(fresh))
+        assert asked == (result.total_chunks if redone_all else result.total_chunks - 2)
+        assert result.markdown.count(word) == 40
+        assert result.markdown.count("建行" if word == "践行" else "践行") == 0
+
+    @pytest.mark.parametrize("ollama", ["running", "not-running"])
+    def test_an_unreadable_word_list_is_reported_before_asking_the_service(self, service, tmp_path, ollama):
+        path = tmp_path / "词表.txt"
+        path.write_bytes(LATIN_1_WORD_LIST)
+        checkpoint = tmp_path / "c.json"
+        fake = service()
+        client = OllamaClient(fake.url if ollama == "running" else _closed_port_url())
+        reader = OllamaProofreader(client, retry_pause=0, vocabulary=_reading(path))
+        with pytest.raises(WordListUnreadable) as caught:
+            reader.proofread(SOURCE, "model-a", checkpoint, lambda d, t: None)
+        assert str(caught.value) == WORD_LIST_ENCODING.format(path=path)
+        assert fake.log == []
+        assert not checkpoint.exists()
 
 
 @pytest.mark.integration

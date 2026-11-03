@@ -1,9 +1,11 @@
 """Proofreading: fix the words without ever losing them.
 
-Order: remove fillers -> fix known terms -> proofread chunk by chunk, checking
-each reply for lost text -> remove fillers again, now that punctuation shows
-where clauses end -> ask only for paragraph positions, so the model never
-touches the body text while paragraphing.
+Order: read the word list once -> remove tics and fillers -> cut into chunks and join
+each chunk's lines -> apply the word list, then the built-in English spelling ->
+proofread chunk by chunk, checking each reply for lost text -> remove fillers again,
+now that punctuation shows where clauses end, and change back only the fixes the
+model undid -> ask only for paragraph positions, so the model never touches the
+body text while paragraphing.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from coursescribe.ollama import (
 )
 from coursescribe.pipeline import ProofreadBlocked, ProofreadResult
 from coursescribe.text import chunk_text, clean_fillers, clean_tics, content_chars, correct_terms, split_sentences
-from coursescribe.vocabulary import EMPTY, Vocabulary, apply_fixes
+from coursescribe.vocabulary import EMPTY, Vocabulary, apply_fixes, fix_reply
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +305,9 @@ class OllamaProofreader:
     def proofread(
         self, text: str, model: str, checkpoint: Path, on_progress: Callable[[int, int], None]
     ) -> ProofreadResult:
+        # First, before the service: a word list that cannot be read stops the task with its own reason
+        # (WordListUnreadable is not caught here). Read once, so one .md uses one word list.
+        self._vocabulary = self._load_vocabulary()
         try:
             self._check_ready(model)
             return self._run(text, model, checkpoint, on_progress)
@@ -337,15 +342,15 @@ class OllamaProofreader:
             raise OllamaModelMissing(model)
 
     def _run(self, text: str, model: str, checkpoint: Path, on_progress) -> ProofreadResult:
-        self._vocabulary = self._load_vocabulary()  # read for each task, so edits apply to the next one
-        prepared = self._tidy(text)
-        chunks = [c for c in chunk_text(prepared, self.chunk_chars) if content_chars(c)]
-        state = _load_state(checkpoint, _fingerprint(prepared, self.chunk_chars))
+        cleaned = clean_fillers(clean_tics(text))
+        # Fixes are looked for in joined lines, so a word split by a line break or a filler is found.
+        chunks = [self._fixed(c) for c in chunk_text(cleaned, self.chunk_chars) if content_chars(c)]
+        state = _load_state(checkpoint, _fingerprint(chunks, self.chunk_chars))
 
         for index, chunk in enumerate(chunks):
             key = str(index)
             if key not in state["chunks"]:
-                state["chunks"][key] = self._proofread_chunk(_join_lines(chunk), model)
+                state["chunks"][key] = self._proofread_chunk(chunk, model)
                 atomic_write_json(checkpoint, state)
             on_progress(index + 1, len(chunks))
 
@@ -361,9 +366,14 @@ class OllamaProofreader:
         markdown = "\n\n".join(paragraphs)
         return ProofreadResult(f"{markdown}\n" if markdown else "", failed, len(chunks))
 
-    def _tidy(self, text: str) -> str:
-        """Everything done by rule: word-list fixes, tics, fillers, English term spelling."""
-        return correct_terms(clean_fillers(clean_tics(apply_fixes(text, self._vocabulary))))
+    def _fixed(self, chunk: str) -> str:
+        """The text sent for one chunk: the user's fixes first, as they were written against the .txt."""
+        return correct_terms(apply_fixes(_join_lines(chunk), self._vocabulary))
+
+    def _tidy_reply(self, sent: str, reply: str) -> str:
+        """Rules again on the reply; each fix still counts once (PRD)."""
+        cleaned = clean_fillers(clean_tics(_join_lines(reply)))
+        return correct_terms(fix_reply(sent, cleaned, self._vocabulary))
 
     def _prompt(self) -> str:
         terms = self._vocabulary.all_terms()
@@ -380,7 +390,7 @@ class OllamaProofreader:
                 logger.warning("Proofreading attempt %d failed: %s", attempt + 1, exc)
                 continue
             if reply and is_lossless(chunk, reply):
-                return {"text": self._tidy(_join_lines(reply)), "ok": True}
+                return {"text": self._tidy_reply(chunk, reply), "ok": True}
             logger.warning("Proofreading attempt %d changed the content; rejected", attempt + 1)
         return {"text": chunk, "ok": False}
 
@@ -436,8 +446,10 @@ def _missing_model_message(model: str) -> str:
     )
 
 
-def _fingerprint(prepared: str, chunk_chars: int) -> str:
-    return hashlib.sha256(f"{chunk_chars}\n{prepared}".encode("utf-8")).hexdigest()
+def _fingerprint(chunks: list[str], chunk_chars: int) -> str:
+    """Covers the text as sent, after the fixes: a changed fix redoes the task, a re-saved encoding does not."""
+    sent = "\x00".join(chunks)
+    return hashlib.sha256(f"{chunk_chars}\n{sent}".encode("utf-8")).hexdigest()
 
 
 def _load_state(checkpoint: Path, fingerprint: str) -> dict:

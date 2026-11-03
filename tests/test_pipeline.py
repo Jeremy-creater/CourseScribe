@@ -30,6 +30,7 @@ from coursescribe.proofread import BREAK_MARKER, TEXT_MARKER, TIMEOUT_MESSAGE, O
 from coursescribe.segments import Segment, read_segments, segments_to_text
 from coursescribe.text import content_chars
 from coursescribe.transcribe import WhisperTranscriber
+from coursescribe.vocabulary import WORD_LIST_ENCODING, WORD_LIST_HELD, WORD_LIST_UNREADABLE, load_vocabulary
 from fake_ollama import FakeOllama, Reply
 from test_transcribe import Engines, _broken_driver, five_seconds, quiet_logs  # noqa: F401 (a fixture)
 
@@ -626,3 +627,167 @@ def test_closed_while_on_the_cpu_restarts_on_the_gpu_without_repeating_or_missin
     assert healthy.seen_by("cuda") == [3.0]
     assert not any(flow.CPU_FALLBACK_NOTE in text for text in seen[restarted.job_id])
     assert sorted(p.name for p in final.folder.iterdir()) == ["课.md", "课.txt"]
+
+
+# --- M2 item 11: the word list never touches the .txt (docs/plans/M2-vocabulary-tests.md) ---
+
+WORDS = "见行 → 践行\njava → Java\n"
+LESSON = ["我们讲见行", "用了 java 和 javascript", "java编程"]
+LESSON_TXT = "我们讲见行\n用了 java 和 javascript\njava编程\n"
+
+
+def _segments(texts: list[str]) -> list[Segment]:
+    return [Segment(float(i), float(i + 1), text) for i, text in enumerate(texts)]
+
+
+def _word_list_proofreader(fake: FakeOllama, word_list: Path, chunk_chars: int = 800) -> OllamaProofreader:
+    client = OllamaClient(fake.url, timeout=5.0, unload_timeout=5.0)
+    return OllamaProofreader(
+        client, chunk_chars=chunk_chars, retry_pause=0, vocabulary=lambda: load_vocabulary(word_list)
+    )
+
+
+def _echo(prompt: str) -> str:
+    return "无" if BREAK_MARKER in prompt else prompt.rsplit(TEXT_MARKER, 1)[1] + "。"
+
+
+@pytest.mark.parametrize(
+    ("data", "texts", "markdown"),
+    [
+        (None, LESSON, "# 课\n\n我们讲见行用了 java 和 javascript java编程。\n"),
+        (WORDS.encode("utf-8"), LESSON, "# 课\n\n我们讲践行用了 Java 和 javascript Java编程。\n"),
+        (WORDS.encode("gbk"), LESSON, "# 课\n\n我们讲践行用了 Java 和 javascript Java编程。\n"),
+        (b"\xff\xfe" + WORDS.encode("utf-16-le"), LESSON, "# 课\n\n我们讲践行用了 Java 和 javascript Java编程。\n"),
+        ("行 → 践行\n".encode("utf-8"), LESSON, "# 课\n\n我们讲见践行用了 java 和 javascript java编程。\n"),
+        (WORDS.encode("utf-8"), ["我们讲见", "行很重要"], "# 课\n\n我们讲践行很重要。\n"),
+        (WORDS.encode("utf-8"), ["我们讲见嗯行很重要"], "# 课\n\n我们讲践行很重要。\n"),
+    ],
+    ids=["no-word-list", "utf-8", "gbk", "utf-16", "fix-contains-word", "split-by-line", "split-by-filler"],
+)
+def test_the_word_list_changes_the_md_and_never_the_txt(tmp_path, data, texts, markdown):
+    word_list = tmp_path / "词表.txt"
+    if data is not None:
+        word_list.write_bytes(data)
+    store = JobStore(tmp_path / "state")
+    job = _job(tmp_path, store)
+    segments = _segments(texts)
+    fake = FakeOllama(_echo)
+    try:
+        _pipeline(store, FakeTranscriber(segments=segments), _word_list_proofreader(fake, word_list)).run(job)
+    finally:
+        fake.close()
+    assert job.stage is Stage.DONE
+    assert job.md_path.read_text(encoding="utf-8") == markdown
+    if texts != LESSON:
+        assert markdown.count("践行") == 1 and "见行" not in markdown
+    assert job.txt_path.read_bytes() == segments_to_text(segments).encode("utf-8")
+    literal = {
+        tuple(LESSON): LESSON_TXT,
+        ("我们讲见", "行很重要"): "我们讲见\n行很重要\n",
+        ("我们讲见嗯行很重要",): "我们讲见嗯行很重要\n",
+    }[tuple(texts)]
+    assert job.txt_path.read_bytes() == literal.encode("utf-8")
+    assert sorted(p.name for p in job.folder.iterdir()) == ["课.md", "课.txt"]
+    if data is not None:
+        assert word_list.read_bytes() == data
+
+
+def _reference_md(tmp_path: Path, chunk_chars: int) -> bytes:
+    base = tmp_path / "reference"
+    base.mkdir()
+    word_list = base / "词表.txt"
+    word_list.write_bytes(WORDS.encode("utf-8"))
+    store = JobStore(base / "state")
+    job = _job(base, store)
+    fake = FakeOllama(_echo)
+    try:
+        _pipeline(store, FakeTranscriber(segments=_segments(LESSON)), _word_list_proofreader(fake, word_list, chunk_chars)).run(job)
+    finally:
+        fake.close()
+    assert job.stage is Stage.DONE
+    return job.md_path.read_bytes()
+
+
+@pytest.mark.parametrize("problem", ["encoding", "held", "folder", "after-half-done"])
+def test_an_unreadable_word_list_fails_the_job_for_retry_and_fixing_it_gives_the_normal_md(
+    tmp_path, monkeypatch, problem
+):
+    from test_recording import _held
+
+    chunk_chars = 20  # three chunks, one per line
+    expected = _reference_md(tmp_path, chunk_chars)
+    word_list = tmp_path / "词表.txt"
+    word_list.write_bytes(WORDS.encode("utf-8"))
+    store = JobStore(tmp_path / "state")
+    job = _job(tmp_path, store)
+    seen: list[str] = []
+    broken = {"second": problem == "after-half-done"}
+
+    def respond(prompt):
+        if BREAK_MARKER not in prompt and broken["second"] and "javascript" in prompt.rsplit(TEXT_MARKER, 1)[1]:
+            return Reply("busy", status=500)
+        return _echo(prompt)
+
+    fake = FakeOllama(respond)
+    held = None
+    try:
+        def run(job):
+            _pipeline(
+                store,
+                FakeTranscriber(segments=_segments(LESSON)),
+                _word_list_proofreader(fake, word_list, chunk_chars),
+                on_status=lambda j, text, fraction: seen.append(text),
+            ).run(job)
+
+        checkpoint_before = None
+        if problem == "after-half-done":
+            run(job)
+            assert job.stage is Stage.WAITING_PROOFREAD
+            checkpoint_before = store.proofread_path(job).read_bytes()
+            broken["second"] = False
+
+        if problem in ("encoding", "after-half-done"):
+            word_list.write_bytes("café -> Café".encode("latin-1"))
+            template = WORD_LIST_ENCODING
+        elif problem == "held":
+            monkeypatch.setattr("coursescribe.files._FILES_CAN_BE_HELD", True)
+            held = _held(monkeypatch, word_list)
+            template = WORD_LIST_HELD
+        else:
+            word_list.unlink()
+            word_list.mkdir()
+            template = WORD_LIST_UNREADABLE
+
+        asked_before = len(fake.log)
+        seen.clear()
+        run(job)
+        saved = store.load_all()[0]
+        assert saved.stage is Stage.FAILED
+        assert saved.can_retry and saved.offers_retry
+        assert saved.message == template.format(path=word_list)
+        assert template.format(path=word_list) in seen
+        assert list(job.folder.glob("*.md")) == []
+        assert len(fake.log) == asked_before
+        assert saved.txt_path.read_bytes() == LESSON_TXT.encode("utf-8")
+        if checkpoint_before is not None:
+            assert store.proofread_path(job).read_bytes() == checkpoint_before
+        assert saved.retry_stage() is Stage.PROOFREADING
+
+        if held is not None:
+            held.release()
+        elif problem == "folder":
+            word_list.rmdir()
+            word_list.write_bytes(WORDS.encode("utf-8"))
+        else:
+            word_list.write_bytes(WORDS.encode("utf-8"))
+        polished_before = sum(1 for p in fake.prompts if BREAK_MARKER not in p)
+        saved.stage = saved.retry_stage()
+        run(saved)
+        polished = sum(1 for p in fake.prompts if BREAK_MARKER not in p) - polished_before
+    finally:
+        fake.close()
+    final = store.load_all()[0]
+    assert final.stage is Stage.DONE
+    assert final.md_path.read_bytes() == expected
+    assert final.txt_path.read_bytes() == LESSON_TXT.encode("utf-8")
+    assert polished == (2 if problem == "after-half-done" else 3)

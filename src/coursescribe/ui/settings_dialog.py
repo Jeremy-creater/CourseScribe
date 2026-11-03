@@ -20,7 +20,9 @@ from PySide6.QtWidgets import (
 from coursescribe.models import MODELS, model_size_label
 from coursescribe.settings import Settings
 from coursescribe.ui.style import set_role
-from coursescribe.vocabulary import ensure_word_list
+from coursescribe.vocabulary import WORD_LIST_CREATE_FAILED, WORD_LIST_UNREADABLE, ensure_word_list
+
+WORD_NOTE = "写常用词，或“听错 → 正确”，校对时自动替换"
 
 
 class SettingsDialog(QDialog):
@@ -66,10 +68,11 @@ class SettingsDialog(QDialog):
         self.word_list_button = QPushButton("打开词表…")
         self.word_list_button.clicked.connect(self._open_word_list)
         self.word_list_button.setEnabled(word_list is not None and open_file is not None)
-        word_note = QLabel("写常用词，或“听错 → 正确”，校对时自动替换")
-        word_note.setProperty("muted", True)
+        self.word_note = QLabel(WORD_NOTE)
+        self.word_note.setWordWrap(True)  # a problem with the file is a long sentence
+        self.word_note.setProperty("muted", True)
         word_row = QHBoxLayout()
-        word_row.addWidget(word_note, 1)
+        word_row.addWidget(self.word_note, 1)
         word_row.addWidget(self.word_list_button)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -110,7 +113,15 @@ class SettingsDialog(QDialog):
     def _open_word_list(self) -> None:
         if self._word_list is None or self._open_file is None:
             return
-        ensure_word_list(self._word_list)
+        if self._word_list.is_dir():
+            self.word_note.setText(WORD_LIST_UNREADABLE.format(path=self._word_list))
+            return
+        try:
+            ensure_word_list(self._word_list)
+        except OSError:
+            self.word_note.setText(WORD_LIST_CREATE_FAILED.format(path=self._word_list))
+            return
+        self.word_note.setText(WORD_NOTE)
         self._open_file(self._word_list)
 
     def result_settings(self) -> Settings:
