@@ -47,15 +47,36 @@ class OllamaIncomplete(OllamaError):
     """The answer stopped at a length limit; it is not a whole answer."""
 
 
+def _local_opener() -> urllib.request.OpenerDirector:
+    """An opener for plain http only.
+
+    A system proxy could not reach a local service, and must not see transcripts. build_opener()
+    would also add an https handler, which loads the Windows certificate store (several
+    milliseconds) for every client although nothing here ever uses https.
+    """
+    opener = urllib.request.OpenerDirector()
+    for handler in (
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPDefaultErrorHandler(),
+        urllib.request.HTTPErrorProcessor(),
+        urllib.request.UnknownHandler(),
+    ):
+        opener.add_handler(handler)
+    return opener
+
+
 class OllamaClient:
     def __init__(self, url: str = DEFAULT_URL, timeout: float = 600.0, unload_timeout: float = 15.0) -> None:
-        if urlparse(url).hostname not in _LOCAL_HOSTS:
+        parsed = urlparse(url)
+        if parsed.hostname not in _LOCAL_HOSTS:
             raise ValueError("Transcripts never leave this computer: Ollama must be local")
+        if parsed.scheme != "http":
+            raise ValueError(f"Ollama on this computer is reached over plain http, not {parsed.scheme!r}")
         self.url = url.rstrip("/")
         self.timeout = timeout
         self.unload_timeout = unload_timeout
-        # A system proxy could not reach a local service, and must not see transcripts.
-        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self._opener = _local_opener()
         self._can_think: dict[str, bool] = {}
 
     def _call(self, path: str, body: dict | None = None, timeout: float | None = None) -> dict:

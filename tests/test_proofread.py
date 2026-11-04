@@ -234,6 +234,12 @@ class TestOllamaClient:
         with pytest.raises(ValueError):
             OllamaClient("http://example.com:11434")
 
+    @pytest.mark.parametrize("url", ["https://127.0.0.1:1", "ftp://127.0.0.1:1", "file://localhost/x"])
+    def test_refuses_anything_but_plain_http(self, url):
+        """Ollama on this computer speaks plain http; the client carries no https handler."""
+        with pytest.raises(ValueError):
+            OllamaClient(url)
+
     def test_system_proxy_is_bypassed(self, service, monkeypatch):
         monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
         monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
