@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
+import random
+import re
 import socket
+import threading
 import time
 import urllib.error
 from pathlib import Path
@@ -17,6 +21,7 @@ from coursescribe.ollama import (
     OllamaClient,
     OllamaDown,
     OllamaError,
+    OllamaIncomplete,
     OllamaModelMissing,
     OllamaTimeout,
 )
@@ -1056,3 +1061,534 @@ def test_real_ollama_timing_out_waits_and_resumes_to_complete_text(tmp_path):
     patient.unload(model)
     assert result.unproofread_chunks == 0
     assert is_lossless(text, result.markdown)
+
+
+# --- Limits and cut-off answers (M2 notes step 1; matrix: docs/plans/M2-notes-1-ollama-tests.md) ---
+
+STOP = {"done": True, "done_reason": "stop"}
+CUT = {"done": True, "done_reason": "length"}
+
+
+def generate_bodies(fake) -> list[bytes]:
+    return [raw for path, raw in fake.bodies if path == "/api/generate" and b'"prompt"' in raw]
+
+
+def warnings_in(caplog) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.levelno == logging.WARNING]
+
+
+def reference_answer(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+class TestGenerateLimits:
+    def test_default_requests_are_byte_for_byte_unchanged(self, service):
+        plain = service(lambda prompt: "好")
+        assert OllamaClient(plain.url).generate("model-a", "问") == "好"
+        assert generate_bodies(plain) == [
+            b'{"model": "model-a", "prompt": "\\u95ee", "stream": false, '
+            b'"options": {"num_ctx": 6144, "temperature": 0.1}}'
+        ]
+        OllamaClient(plain.url).unload("model-a")
+        assert plain.bodies[-1] == ("/api/generate", b'{"model": "model-a", "keep_alive": 0}')
+
+        thinking = service(lambda prompt: "好", capabilities=("completion", "thinking"))
+        assert OllamaClient(thinking.url).generate("model-a", "问") == "好"
+        assert generate_bodies(thinking) == [
+            b'{"model": "model-a", "prompt": "\\u95ee", "stream": false, '
+            b'"options": {"num_ctx": 6144, "temperature": 0.1}, "think": false}'
+        ]
+
+    @pytest.mark.parametrize(
+        ("kwargs", "options"),
+        [
+            ({"num_ctx": 16384}, {"num_ctx": 16384, "temperature": 0.1}),
+            ({"num_predict": 4096}, {"num_ctx": 6144, "temperature": 0.1, "num_predict": 4096}),
+            ({"num_ctx": 32768, "num_predict": 8192}, {"num_ctx": 32768, "temperature": 0.1, "num_predict": 8192}),
+            ({"num_ctx": 1, "num_predict": 1}, {"num_ctx": 1, "temperature": 0.1, "num_predict": 1}),
+            ({"num_ctx": 131072}, {"num_ctx": 131072, "temperature": 0.1}),
+            ({"timeout": 30.0}, {"num_ctx": 6144, "temperature": 0.1}),
+        ],
+    )
+    def test_limits_are_sent_in_the_options(self, service, kwargs, options):
+        fake = service(lambda prompt: "好")
+        assert OllamaClient(fake.url).generate("model-a", "问", **kwargs) == "好"
+        sent = json.loads(generate_bodies(fake)[-1])
+        assert set(sent) == {"model", "prompt", "stream", "options"}
+        assert sent["options"] == options
+        if kwargs == {"timeout": 30.0}:
+            assert generate_bodies(fake)[-1] == (
+                b'{"model": "model-a", "prompt": "\\u95ee", "stream": false, '
+                b'"options": {"num_ctx": 6144, "temperature": 0.1}}'
+            )
+
+    def test_limits_cannot_be_given_by_position(self, service):
+        fake = service(lambda prompt: "好")
+        with pytest.raises(TypeError):
+            OllamaClient(fake.url).generate("model-a", "问", 16384)
+        assert fake.log == []
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("num_ctx", 0),
+            ("num_ctx", -1),
+            ("num_ctx", True),
+            ("num_ctx", 6144.0),
+            ("num_ctx", "6144"),
+            ("num_predict", 0),
+            ("num_predict", -1),
+            ("num_predict", -2),
+            ("num_predict", True),
+            ("num_predict", 100.0),
+            ("timeout", 0),
+            ("timeout", -1.0),
+            ("timeout", float("inf")),
+            ("timeout", float("nan")),
+            ("timeout", True),
+            ("timeout", "30"),
+        ],
+    )
+    def test_bad_limits_are_refused_before_anything_is_sent(self, service, name, value):
+        fake = service(lambda prompt: "好")
+        with pytest.raises(ValueError, match=name):
+            OllamaClient(fake.url).generate("model-a", "问", **{name: value})
+        assert fake.log == []
+
+    @pytest.mark.parametrize(
+        ("text", "fields", "expected"),
+        [
+            ("整理好的笔记", {"done": True, "done_reason": "stop"}, "整理好的笔记"),
+            ("整理好的笔", {"done": True, "done_reason": "length"}, OllamaIncomplete),
+            ("整理好的笔记", None, "整理好的笔记"),
+            ("整理好的笔记", {"done_reason": None}, "整理好的笔记"),
+            ("", {"done_reason": "stop"}, ""),
+            ("", {"done_reason": "length"}, OllamaIncomplete),
+            ("<think>想一想</think>", {"done_reason": "stop"}, ""),
+            ("<think>想一想", {"done_reason": "length"}, OllamaIncomplete),
+            ("  答案  ", {"done_reason": "stop"}, "答案"),
+            ("整理好的笔", {"done": False}, OllamaIncomplete),
+            ("整理好的笔", {"done": False, "done_reason": "stop"}, OllamaIncomplete),
+            ("整理好的笔记", {"done": True}, "整理好的笔记"),
+            ("整理好的笔记", {"done": None}, "整理好的笔记"),
+        ],
+        ids=["stop", "length", "no-field", "null", "empty", "empty-cut", "think-only",
+             "think-cut", "spaces", "not-done", "not-done-stop", "done-only", "done-null"],
+    )
+    def test_a_cut_off_answer_is_never_returned(self, service, caplog, text, fields, expected):
+        fake = service(lambda prompt: Reply(text, fields=fields))
+        client = OllamaClient(fake.url)
+        if expected is OllamaIncomplete:
+            with pytest.raises(OllamaError) as caught:
+                client.generate("model-a", "问", num_ctx=16384, num_predict=4096)
+            assert caught.type is OllamaIncomplete
+        else:
+            assert client.generate("model-a", "问", num_ctx=16384, num_predict=4096) == expected
+        assert warnings_in(caplog) == []
+
+    @pytest.mark.parametrize("reason", ["load", "unload", "context_limit", 5, []])
+    def test_an_unknown_reason_counts_as_whole_and_is_logged_without_the_lecture(self, service, caplog, reason):
+        fake = service(lambda prompt: Reply("讲课内容甲乙丙", fields={"done_reason": reason}))
+        assert OllamaClient(fake.url).generate("model-a", "问") == "讲课内容甲乙丙"
+        logged = warnings_in(caplog)
+        assert len(logged) == 1
+        assert repr(reason) in logged[0].getMessage()
+        assert "讲课内容" not in caplog.text
+
+    def test_cut_off_never_counts_as_whole_for_generated_answers(self, service):
+        rng = random.Random(20261201)
+        pieces = ["", " ", "\n", "答", "整理好的笔记", "<think>x</think>", "<think>", "</think>", "Claude", "长" * 2000]
+        reasons = ["stop", "length", None, "load", "unload", "x", 0]
+        settings = [{}, {"num_ctx": 16384}, {"num_predict": 1}, {"num_ctx": 16384, "num_predict": 1}]
+        current: list[Reply] = []
+        fake = service(lambda prompt: current[0])
+        client = OllamaClient(fake.url)
+        for _ in range(300):
+            text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 3)))
+            fields = {} if rng.random() < 0.2 else {"done_reason": rng.choice(reasons)}
+            if rng.random() < 0.2:
+                fields["done"] = rng.choice([True, False])
+            kwargs = rng.choice(settings)
+            current[:] = [Reply(text, fields=fields or None)]
+            cut = fields.get("done_reason") == "length" or fields.get("done") is False
+            case = f"text={text[:40]!r} fields={fields} kwargs={kwargs}"
+            if cut:
+                with pytest.raises(OllamaError) as caught:
+                    client.generate("model-a", "问", **kwargs)
+                assert caught.type is OllamaIncomplete, case
+            else:
+                assert client.generate("model-a", "问", **kwargs) == reference_answer(text), case
+
+    @pytest.mark.parametrize(
+        ("fields", "words"),
+        [
+            ({"done_reason": "length", "eval_count": 4093}, ["length", "16384", "4096"]),
+            ({"done": False}, ["done"]),
+        ],
+        ids=["length", "not-done"],
+    )
+    def test_the_cut_off_error_names_the_limits_but_not_the_lecture(self, service, fields, words):
+        fake = service(lambda prompt: Reply("讲课内容甲乙丙", fields=fields))
+        with pytest.raises(OllamaError) as caught:
+            OllamaClient(fake.url).generate("model-a", "问", num_ctx=16384, num_predict=4096)
+        assert caught.type is OllamaIncomplete
+        assert not isinstance(caught.value, OllamaBusy | OllamaTimeout | OllamaDown | OllamaModelMissing)
+        for word in words:
+            assert word in str(caught.value)
+        assert "讲课内容" not in str(caught.value)
+
+    @pytest.mark.parametrize("own", [3.0, 3], ids=["float", "int"])
+    def test_a_longer_timeout_for_one_call(self, service, own):
+        fake = service(lambda prompt: Reply("慢的回答", delay=1.5))
+        client = OllamaClient(fake.url, timeout=0.5)
+        assert client.generate("model-a", "问", timeout=own) == "慢的回答"
+        assert client.timeout == 0.5
+
+    def test_a_shorter_timeout_for_one_call(self, service):
+        fake = service(lambda prompt: Reply("晚了", delay=3.0))
+        client = OllamaClient(fake.url, timeout=5.0)
+        started = time.perf_counter()
+        with pytest.raises(OllamaTimeout):
+            client.generate("model-a", "问", timeout=0.2)
+        assert time.perf_counter() - started < 1.5
+        assert client.timeout == 5.0
+
+    def test_without_a_timeout_the_client_timeout_applies(self, service):
+        fake = service(lambda prompt: Reply("晚了", delay=2.0))
+        client = OllamaClient(fake.url, timeout=0.5)
+        with pytest.raises(OllamaTimeout):
+            client.generate("model-a", "问")
+        assert any(path == "/api/generate" for _, path, _ in fake.log)  # not the capability question
+        assert client.timeout == 0.5
+
+    def test_unloading_keeps_its_own_timeout_after_a_call_with_its_own(self, service):
+        fake = service(lambda prompt: "好", unload_reply=lambda: Reply(delay=1.5))
+        client = OllamaClient(fake.url, timeout=0.5, unload_timeout=5.0)
+        assert client.generate("model-a", "问", timeout=3.0) == "好"
+        client.unload("model-a")
+        assert client.timeout == 0.5
+
+    def test_calls_do_not_carry_over_into_the_next(self, service):
+        rng = random.Random(20261202)
+        current: list[Reply] = []
+        fake = service(lambda prompt: current[0])
+        client = OllamaClient(fake.url, timeout=5.0)
+        for i in range(100):
+            kwargs = {}
+            for name, choices in (("num_ctx", [1, 8192, 16384]), ("num_predict", [1, 512]), ("timeout", [2.0])):
+                if rng.random() < 0.5:
+                    kwargs[name] = rng.choice(choices)
+            fields = rng.choice([{"done_reason": "stop"}, {"done_reason": "length"}, None])
+            current[:] = [Reply("好", fields=fields)]
+            if fields == {"done_reason": "length"}:
+                with pytest.raises(OllamaIncomplete):
+                    client.generate("model-a", "问", **kwargs)
+            else:
+                assert client.generate("model-a", "问", **kwargs) == "好", (i, kwargs, fields)
+            expected = {"num_ctx": kwargs.get("num_ctx", 6144), "temperature": 0.1}
+            if "num_predict" in kwargs:
+                expected["num_predict"] = kwargs["num_predict"]
+            assert json.loads(generate_bodies(fake)[-1])["options"] == expected, (i, kwargs)
+        assert len(generate_bodies(fake)) == 100
+        assert sum(path == "/api/show" for _, path, _ in fake.log) == 1
+
+        current[:] = [Reply("好", delay=2.0)]
+        with pytest.raises(OllamaTimeout):
+            client.generate("model-a", "问", timeout=0.5)
+        current[:] = [Reply("好", delay=0.6)]
+        assert client.generate("model-a", "问") == "好"
+        current[:] = [Reply("好")]
+        assert client.generate("model-a", "问", timeout=0.5) == "好"
+        assert client.timeout == 5.0
+
+    def test_one_calls_timeout_does_not_reach_another_thread(self, service):
+        fake = service(lambda prompt: Reply("慢答", delay=1.5) if prompt == "慢" else Reply("快答", delay=0.5))
+        client = OllamaClient(fake.url, timeout=5.0)
+        client.generate("model-a", "预热")  # capabilities are asked once, before the race
+        results: dict[str, object] = {}
+
+        def call(name, **kwargs):
+            try:
+                results[name] = client.generate("model-a", name, **kwargs)
+            except OllamaError as exc:
+                results[name] = exc
+
+        slow = threading.Thread(target=call, args=("慢",), kwargs={"timeout": 0.2})
+        slow.start()
+        deadline = time.perf_counter() + 2.0
+        while not any(prompt == "慢" for _, _, prompt in fake.log):
+            assert time.perf_counter() < deadline, "the first call never reached the service"
+            time.sleep(0.005)
+        fast = threading.Thread(target=call, args=("快",))
+        fast.start()
+        slow.join(5)
+        fast.join(5)
+        assert not slow.is_alive() and not fast.is_alive(), "a call never came back"
+        assert isinstance(results["慢"], OllamaTimeout)
+        assert results["快"] == "快答"
+        assert client.timeout == 5.0
+
+    @pytest.mark.parametrize(
+        ("kwargs", "fields", "expected"),
+        [
+            ({"num_ctx": 16384, "num_predict": 512}, None, "好的"),
+            ({"timeout": 2.0}, None, "好的"),
+            ({"timeout": 2.0}, {"done_reason": "length"}, OllamaIncomplete),
+        ],
+        ids=["limits", "timeout", "cut-off"],
+    )
+    def test_system_proxy_is_still_bypassed_with_limits(self, service, monkeypatch, kwargs, fields, expected):
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+        monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+        fake = service(lambda prompt: Reply("好的", fields=fields))
+        client = OllamaClient(fake.url)
+        if expected is OllamaIncomplete:
+            with pytest.raises(OllamaError) as caught:
+                client.generate("model-a", "问", **kwargs)
+            assert caught.type is OllamaIncomplete
+        else:
+            assert client.generate("model-a", "问", **kwargs) == expected
+        assert len(generate_bodies(fake)) == 1
+        client.unload("model-a")
+        assert fake.bodies[-1] == ("/api/generate", b'{"model": "model-a", "keep_alive": 0}')
+
+    def test_service_down_with_limits_is_down(self):
+        with pytest.raises(OllamaError) as caught:
+            OllamaClient(_closed_port_url()).generate(
+                "model-a", "问", num_ctx=16384, num_predict=512, timeout=2.0
+            )
+        assert caught.type is OllamaDown
+
+    @pytest.mark.parametrize(
+        ("reply", "expected"),
+        [
+            (Reply("x", status=500), OllamaBusy),
+            (Reply("x", status=429), OllamaBusy),
+            (Reply("x", status=404), OllamaModelMissing),
+            (Reply(broken="no-reply"), OllamaBusy),
+            (Reply(broken="short-body"), OllamaBusy),
+            (Reply(raw=b"<html>busy</html>"), OllamaBusy),
+            (Reply("x", delay=5.0), OllamaTimeout),
+            (Reply("x", status=400), OllamaError),
+        ],
+        ids=["500", "429", "404", "no-reply", "short-body", "not-json", "slow", "400"],
+    )
+    def test_service_problems_with_limits_keep_their_kind(self, service, reply, expected):
+        fake = service(lambda prompt: reply)
+        started = time.perf_counter()
+        with pytest.raises(OllamaError) as caught:
+            OllamaClient(fake.url, timeout=30.0).generate(
+                "model-a", "问", num_ctx=16384, num_predict=512, timeout=2.0
+            )
+        assert caught.type is expected
+        assert time.perf_counter() - started < 3
+        assert {path for _, path, _ in fake.log} <= {"/api/show", "/api/generate"}
+
+    def test_a_very_long_prompt_is_sent_whole(self, service):
+        prompt = "开头暗号甲" + "讲课内容。" * 60000 + "结尾暗号乙"
+        fake = service(lambda prompt: "好")
+        started = time.perf_counter()
+        assert OllamaClient(fake.url).generate("model-a", prompt, num_ctx=131072, num_predict=4096) == "好"
+        assert time.perf_counter() - started < 10
+        assert fake.prompts[-1] == prompt
+
+    @pytest.mark.parametrize(
+        "fields", [{"done": True, "done_reason": "unload"}, {"done": False}], ids=["unload", "not-done"]
+    )
+    def test_unloading_does_not_check_for_cut_off_answers(self, service, caplog, fields):
+        fake = service(unload_reply=lambda: Reply(fields=fields))
+        OllamaClient(fake.url).unload("model-a")
+        assert fake.bodies[-1] == ("/api/generate", b'{"model": "model-a", "keep_alive": 0}')
+        assert warnings_in(caplog) == []
+
+
+def _place(prompt: str) -> str:
+    return "break" if BREAK_MARKER in prompt else chunk_of(prompt)[0]
+
+
+class TestCutOffReplies:
+    """A cut-off answer is a failed attempt for that chunk, never a proofread one (PRD)."""
+
+    def test_a_cut_off_answer_that_looks_whole_is_not_proofread(self, service, tmp_path):
+        looks_whole = Reply("乙" * 89 + "。", fields=CUT)
+        fake = service(three_part_model({"乙": [looks_whole, looks_whole]}))
+        checkpoint = tmp_path / "c.json"
+        result = _run(_proofreader(fake, chunk_chars=100), THREE, checkpoint)
+        assert (result.unproofread_chunks, result.total_chunks) == (1, 3)
+        assert content_chars(result.markdown) == content_chars(THREE)
+        assert saved(checkpoint)["chunks"]["1"] == {"text": "乙" * 89, "ok": False}
+        asked = [p for p in polish_prompts(fake) if chunk_of(p)[0] == "乙"]
+        assert len(asked) == 2
+        assert RETRY_NOTE_WORDS not in asked[0]
+        assert RETRY_NOTE_WORDS in asked[1]
+
+    def test_a_whole_second_attempt_after_a_cut_off_one_is_used(self, service, tmp_path):
+        fake = service(in_turn([Reply(PROOFED, fields=CUT), Reply(PROOFED, fields=STOP)]))
+        result = _run(_proofreader(fake), SOURCE, tmp_path / "c.json")
+        assert result.markdown == PROOFED + "\n"
+        assert result.unproofread_chunks == 0
+        prompts = polish_prompts(fake)
+        assert len(prompts) == 2
+        assert RETRY_NOTE_WORDS in prompts[1]
+
+    def test_a_cut_off_paragraph_answer_leaves_that_part_unbroken(self, service, tmp_path):
+        fake = service(three_part_model({"break": [Reply("2", fields=CUT)]}))
+        checkpoint = tmp_path / "c.json"
+        result = _run(_proofreader(fake, chunk_chars=100), THREE, checkpoint)
+        assert "\n\n" not in result.markdown
+        assert content_chars(result.markdown) == content_chars(THREE)
+        assert result.unproofread_chunks == 0
+        assert saved(checkpoint)["breaks"] == {"0/0": []}
+        assert len(break_prompts(fake)) == 1
+
+    def test_every_chunk_cut_off_is_the_same_as_every_chunk_failing(self, service, tmp_path):
+        fake = service(in_turn([Reply(PROOFED, fields=CUT)]))
+        checkpoint = tmp_path / "c.json"
+        with pytest.raises(ProofreadBlocked, match="一段都没有成功"):
+            _run(_proofreader(fake), SOURCE, checkpoint)
+        assert not checkpoint.exists()
+
+    def test_cut_off_answers_never_reach_the_md_nor_make_the_task_wait(self, service, tmp_path):
+        rng = random.Random(20261203)
+        attempts: dict[str, list[tuple[str, bool]]] = {}
+        broken_breaks: list[bool] = []
+
+        def respond(prompt):
+            place = _place(prompt)
+            if place == "break":
+                cut = rng.random() < 1 / 3
+                broken_breaks.append(cut)
+                return Reply("2", fields=CUT if cut else None)
+            cut = rng.random() < 0.5
+            attempts.setdefault(place, []).append((prompt, cut))
+            whole = rng.choice([STOP, None])
+            return Reply(chunk_of(prompt) + "。", fields=CUT if cut else whole)
+
+        fake = service(respond)
+        for group in range(60):
+            attempts.clear()
+            broken_breaks.clear()
+            checkpoint = tmp_path / f"c{group}.json"
+            reader = _proofreader(fake, chunk_chars=100)
+            ok = {}
+            try:
+                result = _run(reader, THREE, checkpoint)
+            except ProofreadBlocked as exc:
+                result = exc
+            for place, tries in attempts.items():
+                assert 1 <= len(tries) <= 2, (group, place, len(tries))
+                assert RETRY_NOTE_WORDS not in tries[0][0]
+                if len(tries) == 2:
+                    assert RETRY_NOTE_WORDS in tries[1][0]
+                ok[place] = any(not cut for _, cut in tries[:2])
+            assert set(ok) == {"甲", "乙", "丙"}, group
+            if not any(ok.values()):
+                assert isinstance(result, ProofreadBlocked), group
+                assert "一段都没有成功" in str(result)
+                assert not checkpoint.exists()
+                continue
+            assert not isinstance(result, ProofreadBlocked), (group, ok)
+            assert result.unproofread_chunks == sum(not v for v in ok.values()), (group, ok)
+            assert content_chars(result.markdown) == content_chars(THREE), group
+            chunks = saved(checkpoint)["chunks"]
+            for index, place in enumerate("甲乙丙"):
+                assert chunks[str(index)]["ok"] is ok[place], (group, place)
+                if not ok[place]:
+                    assert chunks[str(index)]["text"] == chunk_of(attempts[place][0][0]), (group, place)
+            if broken_breaks and all(broken_breaks):
+                assert all(value == [] for value in saved(checkpoint)["breaks"].values()), group
+                assert "\n\n" not in result.markdown or result.unproofread_chunks, group
+
+    def test_proofreading_requests_are_unchanged_and_use_the_client_timeout(self, service, tmp_path):
+        fake = service(three_part_model())
+        _run(_proofreader(fake, chunk_chars=100), THREE, tmp_path / "a.json")
+        assert len(polish_prompts(fake)) == 3
+        assert len(break_prompts(fake)) == 1
+        for raw, prompt in zip(generate_bodies(fake), fake.prompts, strict=True):
+            assert raw == json.dumps(
+                {"model": "model-a", "prompt": prompt, "stream": False,
+                 "options": {"num_ctx": 6144, "temperature": 0.1}}
+            ).encode()
+
+        slow = service(three_part_model({"乙": [SLOW]}))
+        started = time.perf_counter()
+        with pytest.raises(ProofreadBlocked) as caught:
+            _run(_proofreader(slow, timeout=TIMEOUT, chunk_chars=100), THREE, tmp_path / "b.json")
+        assert str(caught.value) == TIMEOUT_MESSAGE
+        assert time.perf_counter() - started < 3
+
+
+NOTES_MODEL = "qwen3.5:9b"
+
+
+def _ready_notes_model(client: OllamaClient) -> None:
+    """Fail with what to do; never download anything."""
+    try:
+        installed = client.models()
+    except OllamaDown:
+        pytest.fail("Ollama is not running. Start Ollama, then run this test again.")
+    if NOTES_MODEL not in installed:
+        pytest.fail(f"Model {NOTES_MODEL} is missing. Run: ollama pull {NOTES_MODEL}")
+
+
+@pytest.mark.integration
+def test_real_ollama_reads_the_start_of_a_long_prompt_only_with_a_large_context(monkeypatch):
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    code = f"蓝鲸{random.Random(20261204).randint(1000, 9999)}号"
+    material, i = [], 0
+    while sum(map(len, material)) < 20000:
+        i += 1
+        material.append(f"第{i}句：数据库索引能让查询变快，但写入会变慢。")
+    prompt = (
+        "下面是一段材料。材料第一句里藏着一个暗号。\n"
+        + f"暗号是{code}。"
+        + "".join(material)
+        + "\n问题：材料第一句里的暗号是什么？只回答暗号本身。"
+    )
+    client = OllamaClient(timeout=600)
+    _ready_notes_model(client)
+    try:
+        large = client.generate(NOTES_MODEL, prompt, num_ctx=32768, num_predict=64, timeout=600)
+        assert code in "".join(large.split())  # the model may answer "蓝鲸 1234 号"
+        try:
+            small = client.generate(NOTES_MODEL, prompt, num_predict=64, timeout=600)
+        except OllamaIncomplete:
+            small = ""
+        except OllamaError as exc:
+            pytest.fail(f"Ollama refused the long prompt instead of dropping its start ({exc}); the control can't run")
+        assert code not in "".join(small.split()), (
+            "默认上下文也读到了暗号：材料可能不够长，或 Ollama 不再截掉开头；num_ctx 是否生效无法由这个用例确认"
+        )
+    finally:
+        client.unload(NOTES_MODEL)
+
+
+@pytest.mark.integration
+def test_real_ollama_stops_at_the_answer_limit_and_it_is_reported_as_cut_off():
+    client = OllamaClient(timeout=300)
+    _ready_notes_model(client)
+    try:
+        with pytest.raises(OllamaIncomplete):
+            client.generate(NOTES_MODEL, "从 1 数到 300，用逗号隔开，不要省略。", num_predict=8, timeout=300)
+    finally:
+        client.unload(NOTES_MODEL)
+
+
+@pytest.mark.integration
+def test_real_ollama_one_short_timeout_then_a_normal_call():
+    client = OllamaClient(timeout=600)
+    _ready_notes_model(client)
+    client.unload(NOTES_MODEL)
+    try:
+        started = time.perf_counter()
+        with pytest.raises(OllamaTimeout):
+            client.generate(NOTES_MODEL, "写一段两百字的介绍。", timeout=0.5)
+        assert time.perf_counter() - started < 5
+        assert client.generate(NOTES_MODEL, "只回答：好", num_predict=16)
+    finally:
+        client.unload(NOTES_MODEL)

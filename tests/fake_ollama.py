@@ -17,6 +17,7 @@ class Reply:
         delay: float = 0.0,
         raw: bytes | None = None,
         broken: str | None = None,
+        fields: dict | None = None,
     ) -> None:
         self.text = text
         self.status = status
@@ -24,6 +25,7 @@ class Reply:
         self.raw = raw  # sent as the body as it is, instead of JSON
         # "no-reply": hang up after reading the request; "short-body": promise more bytes than are sent
         self.broken = broken
+        self.fields = fields  # merged into a 200 answer, e.g. {"done_reason": "length"}
 
 
 class FakeOllama:
@@ -42,6 +44,7 @@ class FakeOllama:
         self.unload_reply = unload_reply
         self.prompts: list[str] = []
         self.requests: list[dict] = []
+        self.bodies: list[tuple[str, bytes]] = []  # (path, raw request bytes) of every POST
         self.log: list[tuple[float, str, str | None]] = []  # (time.perf_counter(), path, prompt)
         self._closing = threading.Event()
         fake = self
@@ -72,7 +75,7 @@ class FakeOllama:
                 if reply.raw is not None:
                     self._send(reply.status, reply.raw)
                 elif reply.status == 200:
-                    self._send(200, normal)
+                    self._send(200, {**normal, **(reply.fields or {})})
                 else:
                     self._send(reply.status, {"error": reply.text})
 
@@ -82,7 +85,9 @@ class FakeOllama:
                 self._reply(fake.tags_reply() if fake.tags_reply else Reply(), normal)
 
             def do_POST(self):
-                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                raw = self.rfile.read(int(self.headers["Content-Length"]))
+                fake.bodies.append((self.path, raw))
+                body = json.loads(raw)
                 fake.log.append((time.perf_counter(), self.path, body.get("prompt")))
                 if self.path == "/api/show":
                     self._send(200, {"capabilities": fake.capabilities})

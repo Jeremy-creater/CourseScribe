@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
+import math
 import re
 import socket
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_URL = "http://127.0.0.1:11434"
 _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -37,6 +41,10 @@ class OllamaModelMissing(OllamaError):
 
 class OllamaBusy(OllamaError):
     """The service failed for now; the same request may work a little later."""
+
+
+class OllamaIncomplete(OllamaError):
+    """The answer stopped at a length limit; it is not a whole answer."""
 
 
 class OllamaClient:
@@ -90,17 +98,42 @@ class OllamaClient:
             self._can_think[model] = "thinking" in shown.get("capabilities", [])
         return self._can_think[model]
 
-    def generate(self, model: str, prompt: str) -> str:
-        body = {
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"num_ctx": _NUM_CTX, "temperature": 0.1},
-        }
+    def generate(
+        self,
+        model: str,
+        prompt: str,
+        *,
+        num_ctx: int = _NUM_CTX,
+        num_predict: int | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        """The model's answer; ``OllamaIncomplete`` if it stopped at a length limit.
+
+        ``num_predict=None`` sends no answer limit: Ollama's own -1 and -2 would remove it silently.
+        """
+        if not _is_count(num_ctx):
+            raise ValueError(f"num_ctx must be a whole number of at least 1, not {num_ctx!r}")
+        if num_predict is not None and not _is_count(num_predict):
+            raise ValueError(f"num_predict must be None or a whole number of at least 1, not {num_predict!r}")
+        if timeout is not None and not _is_seconds(timeout):
+            raise ValueError(f"timeout must be None or a positive number of seconds, not {timeout!r}")
+        options: dict = {"num_ctx": num_ctx, "temperature": 0.1}
+        if num_predict is not None:
+            options["num_predict"] = num_predict
+        body = {"model": model, "prompt": prompt, "stream": False, "options": options}
         if self._thinks(model):
             body["think"] = False
-        reply = self._call("/api/generate", body).get("response", "")
-        return _THINK_BLOCK.sub("", reply).strip()
+        answer = self._call("/api/generate", body, timeout=timeout)
+        reason = answer.get("done_reason")
+        if reason == "length" or answer.get("done") is False:
+            # Only the limits go in the message: logs may be pasted into reports, lectures must not.
+            raise OllamaIncomplete(
+                f"Answer cut off (done_reason={reason!r}, done={answer.get('done')!r}) "
+                f"at num_ctx={num_ctx}, num_predict={num_predict}"
+            )
+        if reason not in (None, "stop"):
+            logger.warning("Unknown done_reason from Ollama, taken as a whole answer: %r", reason)
+        return _THINK_BLOCK.sub("", answer.get("response", "")).strip()
 
     def unload(self, model: str) -> None:
         """Free the model's memory now rather than after the service's idle delay."""
@@ -117,3 +150,14 @@ def _service_reason(exc: urllib.error.HTTPError) -> str:
         exc.close()
     reason = body.decode("utf-8", errors="replace").strip()
     return f"Service returned {exc.code}: {reason}" if reason else f"Service returned {exc.code}"
+
+
+def _is_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _is_seconds(value: object) -> bool:
+    """Zero would make the socket non-blocking and infinity is refused by it."""
+    return (
+        isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+    )
