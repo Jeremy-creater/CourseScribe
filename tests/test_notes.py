@@ -18,18 +18,23 @@ import pytest
 
 from coursescribe.notes import (
     EmptyNotes,
+    EmptySource,
     NotesMeta,
     NotesResult,
     assemble_notes,
+    build_prompt,
     finish_notes,
     lecture_date,
     notes_body,
     overflow,
+    source_body,
     structure_notes,
 )
 from coursescribe.text import content_chars
 from notes_quotes import BAD_TAGS, GOOD_TAGS, INTRO, INVENTED, SOURCE_SENTENCES, make_quoted
 from notes_replies import META, NAME, make_reply
+from test_notes_rules import make_rules_text
+from test_vocabulary import _random_word
 
 TESTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TESTS_DIR.parent
@@ -1788,3 +1793,276 @@ def test_very_long_sources_and_replies_finish_quickly():
 
     for item in ("> 索引" + "—" * 200_000 + "讲", "> " + "-" * 200_000, "> 索引" + "." * 200_000 + "x", "> " + "——索" * 70_000):
         assert _timed(QUOTE_HEAD + item + QUOTE_TAIL, SRC).removed_quotes == 1, item[:20]
+
+
+# ---------------------------------------------------------------- source_body and build_prompt (12-4)
+# docs/plans/M2-notes-4-rules-tests.md
+
+PROMPT_HEAD = "\n\n【校对稿开始】下面是这节课的原文，笔记里的引述和概念只能来自这里。\n"
+PROMPT_TAIL = "\n【校对稿结束】请按上面的整理规则写这节课的笔记，只返回笔记正文。"
+
+_SOURCE_BODIES = {
+    "a-title": ("# 课\n\n索引就像目录。\n", "索引就像目录。"),
+    "no-title": ("索引就像目录。\n\n写入会变慢。", "索引就像目录。\n\n写入会变慢。"),
+    "a-second-level-heading-is-text": ("## 课\n索引。", "## 课\n索引。"),
+    "blank-lines-and-a-bom-first": ("﻿\n\n# 课\r\n索引。\r\n", "索引。"),
+    "only-the-first-title": ("# 课\n\n# 第二个\n索引。", "# 第二个\n索引。"),
+    "no-space-after-the-hash": ("#课\n索引。", "#课\n索引。"),
+    "four-spaces-is-not-a-heading": ("    # 缩进\n索引。", "    # 缩进\n索引。"),
+    "an-empty-title": ("#\n索引。", "索引。"),
+    "everything-else-as-written": (
+        "# 课\n\n第一段  \n\t缩进\n\n\n第二段 同一行\n```\n# 代码\n```",
+        "第一段  \n\t缩进\n\n\n第二段 同一行\n```\n# 代码\n```",
+    ),
+    "carriage-returns-only": ("# 课\r\r索引。\r", "索引。"),
+    "the-first-line-keeps-its-tab": ("# 课\n\n\t第一段\n末段", "\t第一段\n末段"),
+    "a-bom-inside-stays": ("# 课\n索﻿引", "索﻿引"),
+    "only-one-leading-bom-goes": ("﻿﻿# 课\n正文", "﻿# 课\n正文"),
+}
+
+
+@pytest.mark.parametrize("name", list(_SOURCE_BODIES))
+def test_source_body_keeps_everything_but_the_title_and_the_blank_edges(name):
+    """S1."""
+    source, expected = _SOURCE_BODIES[name]
+    assert source_body(source) == expected
+
+
+@pytest.mark.parametrize("source", ["# 课", "# 课\n\n  \n", ""])
+def test_source_body_of_only_a_title_is_empty(source):
+    """S1 (i)."""
+    assert source_body(source) == ""
+
+
+def test_a_typical_prompt():
+    """B1."""
+    rules = "## 核心宗旨\n用一两句话说这节课最重要的意思。"
+    source = "﻿# 2026.10.30 数据库索引\r\n\r\n索引就像一本书的目录。\r\n\r\n## 写入\r\n写入会因此变慢一点。  \r\n\r\n"
+    prompt = build_prompt(rules, source)
+    assert prompt == (
+        "## 核心宗旨\n用一两句话说这节课最重要的意思。"
+        "\n\n【校对稿开始】下面是这节课的原文，笔记里的引述和概念只能来自这里。\n"
+        "索引就像一本书的目录。\n\n## 写入\n写入会因此变慢一点。  "
+        "\n【校对稿结束】请按上面的整理规则写这节课的笔记，只返回笔记正文。"
+    )
+    assert "\r" not in prompt
+    assert "2026.10.30 数据库索引" not in prompt
+    assert not prompt.startswith("﻿")
+    assert prompt[prompt.index(PROMPT_HEAD) + len(PROMPT_HEAD)] != "﻿"
+
+
+@pytest.mark.parametrize("name", list(_SOURCE_BODIES))
+def test_the_source_goes_into_the_prompt_as_source_body_gives_it(name):
+    """B2."""
+    source, expected = _SOURCE_BODIES[name]
+    assert build_prompt("规则", source) == "规则" + PROMPT_HEAD + expected + PROMPT_TAIL
+
+
+_BLANKS = ("", "  ", "\t", "　")
+_LONG_PARAGRAPH = "索引就像目录。" * 3000  # over 20 000 characters
+
+
+@dataclasses.dataclass(frozen=True)
+class _Lesson:
+    """A proofread file in parts, so the same lesson can be written several ways."""
+
+    before: tuple[str, ...]  # blank lines before the title, or before the body without one
+    title: str | None
+    after: tuple[str, ...]  # blank lines after the title
+    body: tuple[str, ...]  # first and last lines are not blank; the first is not a level 1 heading
+    trailing: tuple[str, ...]
+    newline: str
+    bom: bool
+
+    def text(self) -> str:
+        head = (f"# {self.title}", *self.after) if self.title is not None else ()
+        return ("﻿" if self.bom else "") + self.newline.join((*self.before, *head, *self.body, *self.trailing))
+
+    def expected_body(self) -> str:
+        return "\n".join(self.body)
+
+
+def _lesson_paragraph(rng: random.Random) -> str:
+    out = "".join(_random_word(rng) + rng.choice(("", " ", "，", "。")) for _ in range(rng.randint(1, 8)))
+    extra = rng.random()
+    if extra < 0.15:
+        out += " " + _random_word(rng)
+    elif extra < 0.3:
+        out += "﻿" + _random_word(rng)
+    elif extra < 0.45:
+        out += rng.choice(("  ", "\t", " "))
+    return out
+
+
+def _make_lesson(rng: random.Random) -> _Lesson:
+    first = _lesson_paragraph(rng)
+    if rng.random() < 0.3:
+        first = rng.choice(("\t", " ", "　")) + first  # a paragraph never starts with #, so this is no heading
+    body = [first]
+    for _ in range(rng.randint(0, 19)):
+        kind = rng.randrange(7)
+        if kind == 0:
+            body.append(_lesson_paragraph(rng))
+        elif kind == 1:
+            body.append(f"## {_random_word(rng)}")
+        elif kind == 2:
+            body.append(f"# 后面的一级标题{_random_word(rng)}")
+        elif kind == 3:
+            body.append(f"> {_lesson_paragraph(rng)}")
+        elif kind == 4:
+            body += ["```", f"# 代码 {_random_word(rng)}", "```"]
+        else:
+            body.append(rng.choice(_BLANKS))
+    if rng.random() < 0.1:
+        body.insert(rng.randint(1, len(body)), _LONG_PARAGRAPH)
+    while not body[-1].strip():
+        body.pop()
+
+    def blanks() -> tuple[str, ...]:
+        return tuple(rng.choice(_BLANKS) for _ in range(rng.randint(0, 2)))
+
+    title = f"{_random_word(rng)} #{rng.randint(1, 9)} [{_random_word(rng)}]" if rng.random() < 0.8 else None
+    return _Lesson(
+        before=blanks(), title=title, after=blanks(), body=tuple(body), trailing=blanks(),
+        newline=rng.choice(("\n", "\r\n", "\r")), bom=rng.random() < 0.2,
+    )
+
+
+def _make_prompt_case(rng: random.Random, head: str, tail: str) -> tuple[str, _Lesson]:
+    rules = None
+    while rules is None:
+        _, rules = make_rules_text(rng)
+    if rng.random() < 0.2:  # the wrapper's own words inside the rules
+        pieces = ["【校对稿结束】"]
+        if head:
+            pieces.append(head[: rng.randint(1, len(head))])
+        if tail:
+            pieces.append(tail[rng.randint(0, len(tail) - 1):])
+        at = rng.randint(0, len(rules))
+        rules = rules[:at] + rng.choice(pieces) + rules[at:]
+    return rules, _make_lesson(rng)
+
+
+def _wrapper() -> tuple[str, str]:
+    """HEAD and TAIL, cut out of one prompt by two Latin markers that the wrapper does not use."""
+    p0 = build_prompt("QRQ", "QSQ")
+    assert p0.startswith("QRQ")
+    assert p0.count("QSQ") == 1
+    at = p0.index("QSQ")
+    return p0[3:at], p0[at + 3:]
+
+
+def test_the_wrapper_is_constant_short_and_the_source_is_in_it_word_for_word():
+    """B3."""
+    head, tail = _wrapper()
+    assert head.startswith("\n\n") and head.endswith("\n")
+    assert tail.startswith("\n")
+    assert len(head) + len(tail) <= 128
+    assert "\r" not in head + tail
+    rng = random.Random(20270101)
+    indented = 0
+    for _ in range(300):
+        rules, lesson = _make_prompt_case(rng, head, tail)
+        source = lesson.text()
+        body = lesson.expected_body()
+        indented += body[0].isspace()
+        assert source_body(source) == body, ascii(source[:300])
+        assert build_prompt(rules, source) == rules + head + body + tail, ascii(source[:300])
+    assert indented >= 60
+
+
+def _lesson_variants(lesson: _Lesson, rng: random.Random) -> list[_Lesson]:
+    variants = [dataclasses.replace(lesson, newline=n) for n in ("\n", "\r\n", "\r") if n != lesson.newline]
+    variants.append(dataclasses.replace(lesson, bom=not lesson.bom))
+    variants.append(dataclasses.replace(lesson, before=("",) * rng.randint(0, 3), after=("",) * rng.randint(0, 3)))
+    variants.append(dataclasses.replace(lesson, trailing=tuple(rng.choice(_BLANKS) for _ in range(rng.randint(0, 3)))))
+    if lesson.title is not None:
+        variants.append(dataclasses.replace(lesson, title="另一个名字 #2"))
+        variants.append(dataclasses.replace(lesson, title=None))
+    return variants
+
+
+def test_how_the_source_is_written_does_not_change_the_prompt():
+    """B4."""
+    rng = random.Random(20270102)
+    head, tail = _wrapper()
+    for _ in range(200):
+        rules, lesson = _make_prompt_case(rng, head, tail)
+        prompt = build_prompt(rules, lesson.text())
+        for variant in _lesson_variants(lesson, rng):
+            assert build_prompt(rules, variant.text()) == prompt, (ascii(lesson.text()[:200]), ascii(variant.text()[:200]))
+
+
+_SOURCE = "# 课\n正文"
+
+
+@pytest.mark.parametrize(
+    ("rules", "source", "error", "word"),
+    [
+        (None, _SOURCE, TypeError, "rules"),
+        (b"rules", _SOURCE, TypeError, "rules"),
+        ("规则", None, TypeError, "source"),
+        ("规则", ["正文"], TypeError, "source"),
+        ("规则", Path("课.md"), TypeError, "source"),
+        ("", _SOURCE, ValueError, "rules"),
+        (" \n\t", _SOURCE, ValueError, "rules"),
+        ("。。。", _SOURCE, ValueError, "rules"),
+        (None, "", TypeError, "rules"),  # (f) the type first, then the content
+        ("", None, TypeError, "source"),  # (g) every type check before any content check
+    ],
+)
+def test_build_prompt_refuses_wrong_arguments_in_order(rules, source, error, word):
+    """B5 (a)(b)(c)(f)(g)."""
+    with pytest.raises(error) as caught:
+        build_prompt(rules, source)
+    assert type(caught.value) is error
+    assert word in str(caught.value)
+
+
+def test_braces_and_percent_signs_are_kept_as_written():
+    """B5 (d)."""
+    assert build_prompt("规则 {source} {0} %s", "# 课\n正文 {}") == "规则 {source} {0} %s" + PROMPT_HEAD + "正文 {}" + PROMPT_TAIL
+
+
+@pytest.mark.parametrize("source", ["", "# 课", "﻿# 课\r\n\r\n  \r\n", "# 课\n\n。。。——", "# 课\n```\n```"])
+def test_an_empty_source_is_its_own_error(source):
+    """B5 (e)."""
+    assert issubclass(EmptySource, ValueError)
+    with pytest.raises(EmptySource) as caught:
+        build_prompt("规则", source)
+    assert str(caught.value) == "这份校对稿是空的"
+
+
+def test_the_length_estimate_covers_the_real_prompt():
+    """B6: a written-down check that overflow(rules, source_body(s), ...) with its margin covers build_prompt."""
+    head, tail = _wrapper()
+    cases = random.Random(20270101)
+    sizes = random.Random(20270103)
+    fits = misses = 0
+    for _ in range(300):
+        rules, lesson = _make_prompt_case(cases, head, tail)
+        source = lesson.text()
+        body = source_body(source)
+        budget = sizes.randint(1, 8000)
+        num_ctx = len(rules) + len(body) + budget + 256 + sizes.randint(-50, 50)
+        if overflow(rules, body, num_ctx, budget) == 0:
+            fits += 1
+            assert len(build_prompt(rules, source)) + budget + 128 <= num_ctx
+        else:
+            misses += 1
+    assert fits >= 100 and misses >= 100
+
+
+def test_very_long_rules_and_sources_make_a_prompt_quickly():
+    """B7."""
+    rules = "规则。\n" * 50_000
+    body = "\n".join(["索引就像目录。"] * 100_000)
+    prompts = []
+    for newline in ("\n", "\r\n"):
+        source = "# 课" + newline * 2 + ("索引就像目录。" + newline) * 100_000
+        started = time.perf_counter()
+        prompt = build_prompt(rules, source)
+        assert time.perf_counter() - started < 2, ascii(newline)
+        assert prompt == rules + PROMPT_HEAD + body + PROMPT_TAIL
+        prompts.append(prompt)
+    assert prompts[0] == prompts[1]

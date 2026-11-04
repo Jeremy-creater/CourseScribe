@@ -1,17 +1,23 @@
-"""Crash-safe file writing. Finished files never overwrite anything."""
+"""Files on disk: crash-safe writing that never overwrites a finished file, and reading
+the text files the user saves (transcripts, the word list, the notes rules) without guessing."""
 
 from __future__ import annotations
 
 import codecs
+import functools
 import json
+import logging
 import os
 import tempfile
 import time
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from coursescribe.platform import FILES_CAN_BE_HELD
+
+logger = logging.getLogger(__name__)
 
 _REPLACE_TRIES = 20
 _REPLACE_WAIT = 0.05  # seconds; one second in all is far longer than a reader holds a small file
@@ -76,6 +82,29 @@ def _publish(temp: Path, target: Path, data: bytes) -> None:
             os.fsync(stream.fileno())
 
 
+def _remove_temp(temp: Path) -> None:
+    """Clean up after publishing; a refusal (antivirus holding it) leaves a hidden file, not a failure."""
+    try:
+        temp.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not remove the temporary file %s: %s", temp.name, exc)
+
+
+def create_once(path: Path, data: bytes) -> None:
+    """Give ``path`` exactly ``data`` if nothing is there; whatever is there already stays.
+
+    Written whole or not at all. The folder must exist. A failure to write raises OSError;
+    failing to remove the temporary file afterwards does not.
+    """
+    temp = _write_temp(path.parent, data)
+    try:
+        _publish(temp, path, data)
+    except FileExistsError:
+        pass  # another program created it meanwhile; theirs stays
+    finally:
+        _remove_temp(temp)
+
+
 def commit_new_text(path: Path, text: str) -> Path:
     """Atomically publish ``text`` at ``path`` without replacing another file.
 
@@ -130,7 +159,7 @@ class UnknownEncoding(ValueError):
     """The bytes are not in an encoding that can be told for sure."""
 
 
-_TRANSCRIPT_MARKS = (
+_MARKS = (
     (codecs.BOM_UTF8, "utf-8"),
     (codecs.BOM_UTF16_LE, "utf-16-le"),
     (codecs.BOM_UTF16_BE, "utf-16-be"),
@@ -151,7 +180,7 @@ def read_transcript(path: Path) -> str:
     """
     data = _patiently(lambda: _read_bytes_once(path))
     body, encoding = data, "utf-8"
-    for mark, marked_encoding in _TRANSCRIPT_MARKS:
+    for mark, marked_encoding in _MARKS:
         if data.startswith(mark):
             body, encoding = data[len(mark) :], marked_encoding
             break
@@ -161,6 +190,72 @@ def read_transcript(path: Path) -> str:
         raise UnknownEncoding(f"{path.name} is not {encoding}") from exc
     if "\x00" in text:  # UTF-16 without a mark often decodes as UTF-8 full of NULs
         raise UnknownEncoding(f"{path.name} has NUL characters")
+    return text
+
+
+# --- files the user edits: the word list and the notes rules ---
+
+_CHINESE = ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0x3000, 0x303F), (0xFF00, 0xFFEF))
+_WESTERN = ((0x0000, 0x007F), (0x00A0, 0x024F), (0x2000, 0x206F), (0x2190, 0x21FF))
+_ALLOWED_CONTROLS = frozenset("\t\r\n")
+
+
+def _in(ch: str, ranges) -> bool:
+    code = ord(ch)
+    return any(low <= code <= high for low, high in ranges)
+
+
+def _has_chinese(text: str) -> bool:
+    return any(_in(ch, _CHINESE) for ch in text)
+
+
+@functools.lru_cache(maxsize=4096)
+def _in_gb2312(ch: str) -> bool:
+    try:
+        ch.encode("gb2312")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _as_gbk(data: bytes) -> str | None:
+    """Notepad's "ANSI" on Chinese Windows; only text inside GB2312 is believed, the rest is usually a misreading."""
+    try:
+        text = data.decode("gbk")
+        text.encode("gb2312")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return None
+    return text
+
+
+def decode_user_text(data: bytes) -> str | None:
+    """The text of a file the user edits (the word list, the notes rules), or None when its encoding
+    cannot be told for sure. Same on every system."""
+    text: str | None = None
+    for mark, encoding in _MARKS:
+        if data.startswith(mark):
+            try:
+                text = data[len(mark) :].decode(encoding)
+            except UnicodeDecodeError:
+                return None
+            break
+    else:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = _as_gbk(data)
+        else:
+            # GBK bytes can happen to be valid UTF-8 (学习, 之, 浏电保). Read that way they give characters
+            # a Chinese word list does not have: outside GB2312 and not Western. Then GBK is believed instead,
+            # when it reads cleanly into Chinese. A UTF-8 file whose characters are all in GB2312 stays UTF-8.
+            if any(not _in(ch, _WESTERN) and not _in_gb2312(ch) for ch in text):
+                gbk = _as_gbk(data)
+                if gbk is not None and _has_chinese(gbk):
+                    text = gbk
+    if text is None:
+        return None
+    if any(unicodedata.category(ch) == "Cc" and ch not in _ALLOWED_CONTROLS for ch in text):
+        return None  # NULs from UTF-16 without a mark, or bytes that were never text
     return text
 
 

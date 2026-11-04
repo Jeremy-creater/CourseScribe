@@ -43,6 +43,10 @@ class EmptyNotes(ValueError):
     """The reply has no real content once the header lines are removed."""
 
 
+class EmptySource(ValueError):
+    """The proofread text has no real content once its title is removed."""
+
+
 @dataclass(frozen=True)
 class NotesMeta:
     name: str  # the proofread file's name without .md, which is the job name
@@ -192,6 +196,41 @@ def _trim(lines: list[str]) -> list[str]:
     while end > start and _blank(lines[end - 1]):
         end -= 1
     return lines[start:end]
+
+
+# ---------------------------------------------------------------- the source and the prompt
+
+# The program's own words around the source. Together far under PROMPT_MARGIN, so at least
+# 128 of it is left for Ollama's chat template.
+_PROMPT_HEAD = "\n\n【校对稿开始】下面是这节课的原文，笔记里的引述和概念只能来自这里。\n"
+_PROMPT_TAIL = "\n【校对稿结束】请按上面的整理规则写这节课的笔记，只返回笔记正文。"
+
+
+def source_body(source: str) -> str:
+    """The proofread text the model is given and quotes are checked against.
+
+    Without one leading byte order mark, the ``# title`` on the first line that is not
+    blank, and the blank lines at both ends; everything else as written, with "\\n" breaks.
+    """
+    lines = _lines(source)
+    first = next((index for index, line in enumerate(lines) if not _blank(line)), None)
+    if first is not None and (heading := _heading(lines[first])) is not None and heading[0] == 1:
+        lines = lines[first + 1:]
+    return "\n".join(_trim(lines))
+
+
+def build_prompt(rules: str, source: str) -> str:
+    """The rules, then the source without its title, then one line asking for the notes."""
+    if not isinstance(source, str):
+        raise TypeError(f"source must be text: {type(source).__name__}")
+    if not isinstance(rules, str):
+        raise TypeError(f"rules must be text: {type(rules).__name__}")
+    if content_chars(rules) == "":
+        raise ValueError("rules have no content")
+    body = source_body(source)
+    if content_chars(body) == "":
+        raise EmptySource("这份校对稿是空的")
+    return "".join((rules, _PROMPT_HEAD, body, _PROMPT_TAIL))
 
 
 # ---------------------------------------------------------------- notes_body
@@ -436,11 +475,7 @@ def _without_tags(line: str, tags: list[re.Match[str]]) -> str:
 
 def _source_chars(source: str) -> str:
     """What quotes and tags are compared with: the source's letters and digits, without its title."""
-    lines = _lines(source)
-    first = next((index for index, line in enumerate(lines) if not _blank(line)), None)
-    if first is not None and (heading := _heading(lines[first])) is not None and heading[0] == 1:
-        lines = lines[first + 1:]
-    return content_chars("\n".join(lines))
+    return content_chars(source_body(source))
 
 
 # ---------------------------------------------------------------- finish_notes: concept tags

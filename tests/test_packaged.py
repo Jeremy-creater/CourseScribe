@@ -183,3 +183,13 @@ def test_force_closed_during_recording_continues_at_the_next_start(packaged, spo
     done = packaged.wait_until_finished()
     assert done.stage is Stage.DONE, f"{done.message}\n{packaged.log()}"
     assert done.txt_path.exists() and done.md_path.exists()
+
+
+def test_the_packaged_program_has_the_shipped_rules():
+    """M2 item 12-4 (P5): the shipped rules are where the packaged notes_rules module looks for them."""
+    if not EXE.exists():
+        pytest.fail(f"Packaged program not found at {EXE}; build it first")
+    packaged = EXE.parent / "_internal" / "coursescribe" / "notes_rules.txt"
+    source = Path(__file__).resolve().parents[1] / "src" / "coursescribe" / "notes_rules.txt"
+    assert packaged.is_file()
+    assert packaged.read_bytes() == source.read_bytes()

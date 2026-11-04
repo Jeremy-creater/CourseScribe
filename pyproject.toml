@@ -28,7 +28,7 @@ gpu = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-coursescribe = ["ui/*.svg"]
+coursescribe = ["ui/*.svg", "notes_rules.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

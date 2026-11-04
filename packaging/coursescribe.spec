@@ -27,7 +27,11 @@ analysis = Analysis(
     binaries=collect_dynamic_libs("ctranslate2") + collect_dynamic_libs("onnxruntime") + gpu_binaries,
     datas=collect_data_files("faster_whisper")
     + collect_data_files("soundcard")
-    + [(str(ROOT / "src" / "coursescribe" / "ui" / "chevron.svg"), "coursescribe/ui")],
+    + [
+        (str(ROOT / "src" / "coursescribe" / "ui" / "chevron.svg"), "coursescribe/ui"),
+        # Beside notes_rules.py, where SHIPPED_RULES looks for it.
+        (str(ROOT / "src" / "coursescribe" / "notes_rules.txt"), "coursescribe"),
+    ],
     hiddenimports=["soundcard.mediafoundation", "_cffi_backend", "coursescribe.ui.app"],
     excludes=["tkinter", "matplotlib", "pytest", "IPython", "torch"],
 )

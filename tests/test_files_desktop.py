@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from coursescribe.files import read_transcript
+from coursescribe.notes_rules import RULES_HELD, NotesRules, NotesRulesUnreadable, load_notes_rules
 from coursescribe.pipeline import SOURCE_HELD, NoAudio
 from coursescribe.platform import FILES_CAN_BE_HELD
 from coursescribe.vocabulary import WORD_LIST_HELD, Vocabulary, WordListUnreadable, load_vocabulary
@@ -59,6 +60,29 @@ def test_word_list_read_waits_out_a_short_real_hold_and_reports_a_long_one(tmp_p
         _wait_until_readable(word_list, 5.0)
     assert load_vocabulary(word_list) == expected
     assert word_list.read_bytes() == data
+
+
+def test_rules_read_waits_out_a_short_real_hold_and_reports_a_long_one(tmp_path):
+    """M2 item 12-4 (G1): the stand-in for held rules matches a real Windows hold."""
+    data = "## 核心宗旨\r\n写一句话。\r\n".encode("gbk")
+    rules = tmp_path / "整理规则.txt"
+    rules.write_bytes(data)
+    expected = NotesRules("## 核心宗旨\n写一句话。", None)
+
+    hold_without_sharing(rules, 0.3)
+    assert load_notes_rules(rules) == expected
+    _wait_until_readable(rules, 5.0)
+
+    hold_without_sharing(rules, 3.0)
+    if FILES_CAN_BE_HELD:
+        started = time.monotonic()
+        with pytest.raises(NotesRulesUnreadable) as caught:
+            load_notes_rules(rules)
+        assert str(caught.value) == RULES_HELD.format(path=rules)
+        assert time.monotonic() - started < 2
+        _wait_until_readable(rules, 5.0)
+    assert load_notes_rules(rules) == expected
+    assert rules.read_bytes() == data
 
 
 @pytest.mark.engine

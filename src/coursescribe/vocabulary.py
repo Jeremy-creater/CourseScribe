@@ -7,11 +7,9 @@ common words are given to the proofreading model as a hint.
 
 from __future__ import annotations
 
-import codecs
 import functools
 import logging
 import re
-import unicodedata
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -190,73 +188,6 @@ def fix_reply(sent: str, reply: str, vocabulary: Vocabulary) -> str:
 
 # --- reading ---
 
-_CHINESE = ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0x3000, 0x303F), (0xFF00, 0xFFEF))
-_WESTERN = ((0x0000, 0x007F), (0x00A0, 0x024F), (0x2000, 0x206F), (0x2190, 0x21FF))
-_ALLOWED_CONTROLS = frozenset("\t\r\n")
-_MARKS = (
-    (codecs.BOM_UTF8, "utf-8"),
-    (codecs.BOM_UTF16_LE, "utf-16-le"),
-    (codecs.BOM_UTF16_BE, "utf-16-be"),
-)
-
-
-def _in(ch: str, ranges) -> bool:
-    code = ord(ch)
-    return any(low <= code <= high for low, high in ranges)
-
-
-def _has_chinese(text: str) -> bool:
-    return any(_in(ch, _CHINESE) for ch in text)
-
-
-@functools.lru_cache(maxsize=4096)
-def _in_gb2312(ch: str) -> bool:
-    try:
-        ch.encode("gb2312")
-    except UnicodeEncodeError:
-        return False
-    return True
-
-
-def _as_gbk(data: bytes) -> str | None:
-    """Notepad's "ANSI" on Chinese Windows; only text inside GB2312 is believed, the rest is usually a misreading."""
-    try:
-        text = data.decode("gbk")
-        text.encode("gb2312")
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        return None
-    return text
-
-
-def _decode_word_list(data: bytes) -> str | None:
-    """The text of the word list, or None when its encoding cannot be told for sure. Same on every system."""
-    text: str | None = None
-    for mark, encoding in _MARKS:
-        if data.startswith(mark):
-            try:
-                text = data[len(mark) :].decode(encoding)
-            except UnicodeDecodeError:
-                return None
-            break
-    else:
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            text = _as_gbk(data)
-        else:
-            # GBK bytes can happen to be valid UTF-8 (学习, 之, 浏电保). Read that way they give characters
-            # a Chinese word list does not have: outside GB2312 and not Western. Then GBK is believed instead,
-            # when it reads cleanly into Chinese. A UTF-8 list whose characters are all in GB2312 stays UTF-8.
-            if any(not _in(ch, _WESTERN) and not _in_gb2312(ch) for ch in text):
-                gbk = _as_gbk(data)
-                if gbk is not None and _has_chinese(gbk):
-                    text = gbk
-    if text is None:
-        return None
-    if any(unicodedata.category(ch) == "Cc" and ch not in _ALLOWED_CONTROLS for ch in text):
-        return None  # NULs from UTF-16 without a mark, or bytes that were never text
-    return text
-
 
 def load_vocabulary(path: Path) -> Vocabulary:
     """Read the word list; this never changes, creates or deletes a file.
@@ -276,7 +207,7 @@ def load_vocabulary(path: Path) -> Vocabulary:
     except OSError as exc:
         logger.warning("Could not read the word list: %s", exc)
         raise WordListUnreadable(WORD_LIST_UNREADABLE.format(path=path)) from exc
-    text = _decode_word_list(data)
+    text = files.decode_user_text(data)
     if text is None:
         logger.warning("The word list is in an encoding that cannot be told for sure")
         raise WordListUnreadable(WORD_LIST_ENCODING.format(path=path))
@@ -291,11 +222,4 @@ def ensure_word_list(path: Path) -> None:
     if path.exists():
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = TEMPLATE.encode("utf-8")
-    temp = files._write_temp(path.parent, data)
-    try:
-        files._publish(temp, path, data)
-    except FileExistsError:
-        pass
-    finally:
-        temp.unlink(missing_ok=True)
+    files.create_once(path, TEMPLATE.encode("utf-8"))
