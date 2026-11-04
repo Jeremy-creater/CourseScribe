@@ -18,6 +18,7 @@ class Reply:
         raw: bytes | None = None,
         broken: str | None = None,
         fields: dict | None = None,
+        close_service: bool = False,
     ) -> None:
         self.text = text
         self.status = status
@@ -26,6 +27,9 @@ class Reply:
         # "no-reply": hang up after reading the request; "short-body": promise more bytes than are sent
         self.broken = broken
         self.fields = fields  # merged into a 200 answer, e.g. {"done_reason": "length"}
+        # Ollama quits while working on this request: the service shuts itself down, so this
+        # request is hung up on without an answer and later connections are refused.
+        self.close_service = close_service
 
 
 class FakeOllama:
@@ -36,12 +40,14 @@ class FakeOllama:
         capabilities=("completion",),
         tags_reply: Callable[[], Reply] | None = None,
         unload_reply: Callable[[], Reply] | None = None,
+        show_reply: Callable[[], Reply] | None = None,
     ) -> None:
         self.respond = respond
         self.models = list(models)
         self.capabilities = list(capabilities)
         self.tags_reply = tags_reply
         self.unload_reply = unload_reply
+        self.show_reply = show_reply  # None: /api/show always answers with the capabilities
         self.prompts: list[str] = []
         self.requests: list[dict] = []
         self.bodies: list[tuple[str, bytes]] = []  # (path, raw request bytes) of every POST
@@ -64,6 +70,12 @@ class FakeOllama:
                     pass  # the client gave up waiting
 
             def _reply(self, reply: Reply, normal: dict) -> None:
+                if reply.close_service:
+                    # Joined, so the port already refuses connections when this request is hung up on:
+                    # a request sent again at once must find the service gone, not half closed.
+                    closer = threading.Thread(target=fake.close, daemon=True)
+                    closer.start()
+                    closer.join()
                 fake._closing.wait(reply.delay)
                 if fake._closing.is_set():
                     return
@@ -90,6 +102,9 @@ class FakeOllama:
                 body = json.loads(raw)
                 fake.log.append((time.perf_counter(), self.path, body.get("prompt")))
                 if self.path == "/api/show":
+                    if fake.show_reply:
+                        self._reply(fake.show_reply(), {"capabilities": fake.capabilities})
+                        return
                     self._send(200, {"capabilities": fake.capabilities})
                     return
                 fake.requests.append(body)
@@ -106,6 +121,10 @@ class FakeOllama:
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         # A short poll keeps close() quick; shutdown() waits for one poll.
         threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+    @property
+    def closed(self) -> bool:
+        return self._closing.is_set()
 
     def close(self) -> None:
         self._closing.set()
