@@ -155,7 +155,9 @@ class FakeKeepAwake:
 
 
 class Rig:
-    def __init__(self, tmp_path: Path, capture_fails=False, transcriber=None, proofreader=None, open_capture=None):
+    def __init__(
+        self, tmp_path: Path, capture_fails=False, transcriber=None, proofreader=None, open_capture=None, notes_writer=None
+    ):
         self.tmp_path = tmp_path
         self.store = JobStore(tmp_path / "state")
         self.settings = SettingsStore(tmp_path / "settings.json", Settings(tmp_path / "out", "large-v3", "model-a"))
@@ -175,6 +177,7 @@ class Rig:
             stopping=threading.Event(),
             keep_awake=self.awake,
             now=lambda: NOW,
+            notes_writer=notes_writer,
         )
         self.controller.add_listener(self.states.append)
         self.closed = False

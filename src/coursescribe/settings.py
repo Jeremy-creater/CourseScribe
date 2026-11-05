@@ -12,7 +12,7 @@ from pathlib import Path
 from platformdirs import user_data_dir, user_documents_dir
 
 from coursescribe.files import atomic_write_json, read_json
-from coursescribe.models import DEFAULT_PROOFREAD_MODEL, DEFAULT_TRANSCRIBE_MODEL
+from coursescribe.models import DEFAULT_NOTES_MODEL, DEFAULT_PROOFREAD_MODEL, DEFAULT_TRANSCRIBE_MODEL
 from coursescribe.platform import cloud_sync_roots
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,7 @@ class Settings:
     output_dir: Path
     transcribe_model: str
     proofread_model: str
+    notes_model: str = DEFAULT_NOTES_MODEL  # only in memory for now; saving it comes with the settings window
 
 
 def _parts(path: str | Path | None) -> tuple[str, ...] | None:

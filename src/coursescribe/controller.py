@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 from collections.abc import Callable, Iterable
@@ -11,8 +12,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
-from coursescribe.jobs import Job, JobStore, SaveFolderTooLong, Stage
+from coursescribe.files import unique_path
+from coursescribe.jobs import Job, JobKind, JobStore, SaveFolderTooLong, Stage, is_notes_file, notes_file_for, path_fits
 from coursescribe.models import model_size_label
+from coursescribe.notes_writer import OllamaNotesWriter
 from coursescribe.pipeline import Pipeline, Proofreader, Transcriber
 from coursescribe.recorder import AudioCapture, RecordingFailed, RecordingSession
 from coursescribe.settings import Settings, SettingsStore
@@ -24,6 +27,11 @@ MEDIA_SUFFIXES = frozenset(
     {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg", ".opus", ".wma",
      ".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".ts"}
 )
+
+
+def _same_file(path: Path) -> str:
+    """One spelling for every way of naming the same file; a file no longer there compares by its path."""
+    return os.path.normcase(os.path.realpath(path))
 
 
 def _remove_if_empty(folder: Path) -> None:
@@ -45,6 +53,16 @@ class KeepAwake(Protocol):
     def release(self) -> None: ...
 
 
+NOTES_ALREADY = "{name}：已经在整理了。"
+NOTES_ALREADY_WAITING = "{name}：已经在整理了，正在等 Ollama。处理好后点“继续整理笔记”。"
+NOTES_NOT_A_FILE = "没有整理：{name}（找不到这个文件，可能被移走或删除了）"
+NOTES_NOT_MD = "没有整理：{name}（只能对校对稿 .md 生成整理笔记）"
+NOTES_IS_NOTES = "没有整理：{name}（这已经是整理笔记了，请选它的校对稿）"
+NOTES_PATH_TOO_LONG_BEFORE = (
+    "没有整理：{name}（笔记文件的路径会太长：{path}）。请把校对稿挪到路径短一些的文件夹，或把它的名字改短，"
+    "再生成整理笔记。校对稿没有变。"
+)
+
 _MAX_ATTEMPTS = 2
 _PAUSED = "这个任务连续两次让程序意外退出，已暂停。可以点“重试”再试一次，或点“忽略”。"
 
@@ -58,6 +76,7 @@ class AppState:
     notice: str = ""
     pending: int = 0
     waiting_proofread: int = 0
+    waiting_notes: int = 0
     failed: int = 0
     model_needed: str | None = None
     downloading: bool = False
@@ -76,6 +95,7 @@ class AppController:
         stopping: threading.Event,
         keep_awake: KeepAwake,
         now: Callable[[], datetime] = datetime.now,
+        notes_writer: OllamaNotesWriter | None = None,
     ) -> None:
         self.store = store
         self.settings_store = settings
@@ -84,7 +104,9 @@ class AppController:
         self._download_model = download_model
         self._stopping = stopping
         self._now = now
-        self._pipeline = Pipeline(store, transcriber, proofreader, repair_wav, on_status=self._on_job_status)
+        self._pipeline = Pipeline(
+            store, transcriber, proofreader, repair_wav, on_status=self._on_job_status, notes_writer=notes_writer
+        )
         self._queue: queue.Queue[Job | None] = queue.Queue()
         self._queued_ids: set[str] = set()
         self._worker = threading.Thread(target=self._work, name="jobs", daemon=True)
@@ -163,7 +185,7 @@ class AppController:
             self._enqueue(job)
         changes = self._waiting_counts()
         if paused:
-            changes["notice"] = "、".join(job.folder.name for job in paused) + "：" + _PAUSED
+            changes["notice"] = "、".join(job.label for job in paused) + "：" + _PAUSED
         self._publish(**changes)
 
     def shutdown(self) -> None:
@@ -205,7 +227,7 @@ class AppController:
         job.attempts += 1
         if not self._save_running(job):
             # left as it was on disk, so the next start picks it up
-            self._finish_job(job, notice=f"{job.folder.name}：{self._data_problem()}这个任务先放着，下次打开程序会接着做。")
+            self._finish_job(job, notice=f"{job.label}：{self._data_problem()}这个任务先放着，下次打开程序会接着做。")
             return
         try:
             if job.stage is Stage.WAITING_MODEL and job.model_download_requested:
@@ -217,7 +239,7 @@ class AppController:
         if self._save_running(job):
             self._finish_job(job)
         else:
-            self._finish_job(job, notice=f"{job.folder.name}：{self._data_problem()}")
+            self._finish_job(job, notice=f"{job.label}：{self._data_problem()}")
 
     def _save_running(self, job: Job) -> bool:
         try:
@@ -255,12 +277,15 @@ class AppController:
 
     @staticmethod
     def _usual_notice(job: Job, current: str) -> str:
+        if job.stage is Stage.DONE and job.kind is JobKind.NOTES and job.notes_path is not None:
+            return f"笔记已生成：{job.notes_path.name}"
         if job.stage is Stage.DONE:
             name = job.folder.name
             return f"完成：{name}。{job.message}" if job.message else f"完成：{name}"
         if job.stage is Stage.FAILED:
-            return f"{job.folder.name}：{job.message}"
-        if job.stage in (Stage.WAITING_PROOFREAD, Stage.WAITING_MODEL) and "下载失败" not in current:
+            return f"{job.label}：{job.message}"
+        waiting = (Stage.WAITING_PROOFREAD, Stage.WAITING_MODEL, Stage.WAITING_NOTES)
+        if job.stage in waiting and "下载失败" not in current:
             return job.message
         return current
 
@@ -269,6 +294,7 @@ class AppController:
         needing_model = [job.transcribe_model for job in unfinished if job.stage is Stage.WAITING_MODEL]
         return {
             "waiting_proofread": sum(job.stage is Stage.WAITING_PROOFREAD for job in unfinished),
+            "waiting_notes": sum(job.stage is Stage.WAITING_NOTES for job in unfinished),
             "model_needed": needing_model[0] if needing_model else None,
             "failed": len(self.store.failed_to_offer()),
         }
@@ -432,22 +458,39 @@ class AppController:
         self._change_jobs(self.store.failed_to_offer(), self._retry_from_failed_step, queue=True)
 
     def dismiss_failed(self) -> None:
-        self._change_jobs(self.store.failed_to_offer(), self._dismiss, queue=False)
+        self._change_jobs(self.store.failed_to_offer(), self._dismiss, queue=False, then=self._forget_notes_reply)
 
     def _retry_proofreading(self, job: Job) -> None:
         job.proofread_model = self.settings.proofread_model
 
-    @staticmethod
-    def _retry_from_failed_step(job: Job) -> None:
+    def _continue_notes(self, job: Job) -> None:
+        job.notes_model = self.settings.notes_model
+
+    def _retry_from_failed_step(self, job: Job) -> None:
         job.stage = job.retry_stage()
         job.message = ""
         job.attempts = 0
+        # Without a kept reply the model is what failed, and the message says to pick another in the
+        # settings. With one, the model did its part: the same model reuses it instead of writing again.
+        if job.kind is JobKind.NOTES and not self.store.notes_path(job).exists():
+            job.notes_model = self.settings.notes_model
 
     @staticmethod
     def _dismiss(job: Job) -> None:
         job.dismissed = True
 
-    def _change_jobs(self, jobs: list[Job], change: Callable[[Job], None], queue: bool) -> None:
+    def _forget_notes_reply(self, job: Job) -> None:
+        """The kept reply holds the lesson in the model's words: not kept once the job is dismissed."""
+        if job.kind is JobKind.NOTES:
+            self.store.remove_working_files(job)
+
+    def _change_jobs(
+        self,
+        jobs: list[Job],
+        change: Callable[[Job], None],
+        queue: bool,
+        then: Callable[[Job], None] | None = None,
+    ) -> None:
         not_saved = []
         for job in jobs:
             with self._lock:
@@ -455,11 +498,67 @@ class AppController:
                     continue  # the worker still has it and will save its own copy
             change(job)
             if not self._save_running(job):
-                not_saved.append(job.folder.name)
-            elif queue:
+                not_saved.append(job.label)
+                continue
+            if then is not None:
+                then(job)
+            if queue:
                 self._enqueue(job)
         notice = "没有处理：" + "、".join(not_saved) + "。" + self._data_problem() if not_saved else ""
         self._publish(notice=notice, **self._waiting_counts())
+
+    def make_notes(self, md_path: Path) -> None:
+        """Organised notes for a proofread .md: "生成整理笔记", or a .md dropped on the window.
+
+        Nothing is created before the job runs. The same .md has at most one notes job that is
+        unfinished or offering "重试": clicking again says so, or retries the failed one.
+        """
+        path = Path(os.path.abspath(md_path))
+        if not path.is_file():
+            self._publish(notice=NOTES_NOT_A_FILE.format(name=path.name))
+            return
+        if path.suffix.lower() != ".md":
+            self._publish(notice=NOTES_NOT_MD.format(name=path.name))
+            return
+        if is_notes_file(path):
+            self._publish(notice=NOTES_IS_NOTES.format(name=path.name))
+            return
+        chosen = unique_path(notes_file_for(path))  # the name this job would write now
+        if not path_fits(chosen):
+            self._publish(notice=NOTES_PATH_TOO_LONG_BEFORE.format(name=path.name, path=chosen))
+            return
+        key = _same_file(path)
+        with self._lock:  # the check and the save together, or two clicks at once make two jobs
+            mine = [
+                job
+                for job in self.store.load_all()
+                if job.kind is JobKind.NOTES and job.source_md is not None and _same_file(job.source_md) == key
+            ]
+            for job in mine:
+                # Running, queued, or just saved as failed by the worker, which has not let go of it yet.
+                if job.job_id in self._queued_ids:
+                    self._publish(notice=NOTES_ALREADY.format(name=job.label))
+                    return
+            for job in mine:
+                if job.stage in (Stage.NOTES, Stage.WAITING_NOTES):
+                    template = NOTES_ALREADY_WAITING if job.stage is Stage.WAITING_NOTES else NOTES_ALREADY
+                    self._publish(notice=template.format(name=job.label))
+                    return
+            retrying = [job for job in mine if job.offers_retry]
+            if retrying:
+                job = retrying[0]
+                self._retry_from_failed_step(job)
+            else:
+                job = Job.new_notes(path, self.settings.notes_model)
+            if not self._save_running(job):
+                self._publish(notice=f"没有整理：{path.name}。{self._data_problem()}")
+                return
+            self._enqueue(job, notice="", **self._waiting_counts())
+
+    def continue_notes(self) -> None:
+        """"继续整理笔记": try again the notes jobs waiting for Ollama, with the notes model set now."""
+        waiting = [job for job in self.store.unfinished() if job.stage is Stage.WAITING_NOTES]
+        self._change_jobs(waiting, self._continue_notes, queue=True)
 
     def download_needed_model(self) -> None:
         """The user has agreed to the download; waiting jobs continue after it."""

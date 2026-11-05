@@ -4,6 +4,7 @@ from __future__ import annotations
 
 DEFAULT_TRANSCRIBE_MODEL = "large-v3"
 DEFAULT_PROOFREAD_MODEL = "gemma4:12b"
+DEFAULT_NOTES_MODEL = "qwen3.5:9b"
 
 MODELS = {
     "large-v3": 3.1,

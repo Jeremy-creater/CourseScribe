@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 import threading
 import time
 import unicodedata
@@ -20,6 +22,7 @@ logger = logging.getLogger(__name__)
 class JobKind(str, Enum):
     RECORDING = "recording"
     FILE = "file"
+    NOTES = "notes"
 
 
 class Stage(str, Enum):
@@ -28,6 +31,8 @@ class Stage(str, Enum):
     WAITING_MODEL = "waiting_model"
     PROOFREADING = "proofreading"
     WAITING_PROOFREAD = "waiting_proofread"
+    NOTES = "notes"
+    WAITING_NOTES = "waiting_notes"
     DONE = "done"
     FAILED = "failed"
 
@@ -55,6 +60,25 @@ class SaveFolderTooLong(Exception):
 def _units(text: str) -> int:
     """Length as Windows counts it, in UTF-16 units."""
     return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def path_fits(path: Path) -> bool:
+    """Whether Windows can open ``path`` without long-path support."""
+    return _units(str(path)) <= PATH_LIMIT
+
+
+NOTES_SUFFIX = "-整理笔记"
+_NOTES_NAME = re.compile(re.escape(NOTES_SUFFIX) + r"( \(\d+\))?\.md$", re.IGNORECASE)
+
+
+def notes_file_for(source_md: Path) -> Path:
+    """Where the organised notes of a proofread ``.md`` go: beside it, ``名称-整理笔记.md``."""
+    return source_md.with_name(f"{source_md.stem}{NOTES_SUFFIX}.md")
+
+
+def is_notes_file(path: Path) -> bool:
+    """Whether ``path`` is named like organised notes (``…-整理笔记.md``, ``…-整理笔记 (2).md``)."""
+    return _NOTES_NAME.search(path.name) is not None
 
 
 def _extends(char: str) -> bool:
@@ -115,6 +139,12 @@ class Job:
     dismissed: bool = False
     # the whole transcription is in the checkpoint, so a lost .txt is written again without transcribing
     transcript_complete: bool = False
+    source_md: Path | None = None  # a notes job's proofread .md, as a full path
+    notes_path: Path | None = None  # chosen just before the notes are written, and saved first
+    notes_model: str = ""
+    removed_quotes: int = 0
+    removed_concepts: int = 0
+    rules_note: str | None = None
 
     @classmethod
     def new_recording(cls, root: Path, now: datetime, transcribe_model: str, proofread_model: str) -> Job:
@@ -128,6 +158,20 @@ class Job:
         name = job_name(source.stem, root)
         folder = unique_dir(root / name)
         return cls._create(JobKind.FILE, Stage.TRANSCRIBING, folder, name, source, transcribe_model, proofread_model)
+
+    @classmethod
+    def new_notes(cls, source_md: Path, notes_model: str) -> Job:
+        """A job that only notes the .md down: nothing is created, read or written here.
+
+        A notes job works on ``source_md`` and ``notes_path`` only; the other paths are filled
+        in so code that shows any job (its folder, its name) needs no special case.
+        """
+        source = Path(os.path.abspath(source_md))
+        job = cls._create(JobKind.NOTES, Stage.NOTES, source.parent, source.stem, source, "", "")
+        job.md_path = source
+        job.source_md = source
+        job.notes_model = notes_model
+        return job
 
     @classmethod
     def _create(
@@ -155,9 +199,18 @@ class Job:
 
     def retry_stage(self) -> Stage:
         """Where a failed job picks up again: keep the transcript if there is one."""
+        if self.kind is JobKind.NOTES:
+            return Stage.NOTES  # the .txt beside a proofread .md is not this job's to proofread
         if self.txt_path.is_file():
             return Stage.PROOFREADING
         return Stage.RECORDING if self.kind is JobKind.RECORDING else Stage.TRANSCRIBING
+
+    @property
+    def label(self) -> str:
+        """What the notices call this job: the .md of a notes job, the folder of the others."""
+        if self.kind is JobKind.NOTES and self.source_md is not None:
+            return self.source_md.name
+        return self.folder.name
 
     @property
     def offers_retry(self) -> bool:
@@ -169,6 +222,8 @@ class Job:
         raw["stage"] = self.stage.value
         for key in ("folder", "audio_path", "txt_path", "md_path"):
             raw[key] = str(raw[key])
+        for key in _OPTIONAL_PATHS:
+            raw[key] = None if raw[key] is None else str(raw[key])
         return raw
 
     @classmethod
@@ -178,7 +233,14 @@ class Job:
         values["stage"] = Stage(raw["stage"])
         for key in ("folder", "audio_path", "txt_path", "md_path"):
             values[key] = Path(raw[key])
+        for key in _OPTIONAL_PATHS:
+            if values.get(key) is not None:  # older versions wrote no such key: the default stands
+                values[key] = Path(values[key])
         return cls(**values)
+
+
+_OPTIONAL_PATHS = ("source_md", "notes_path")
+_WORKING_FILES = (".proofread.json", ".notes.json")
 
 
 class JobStore:
@@ -195,8 +257,8 @@ class JobStore:
             return []
         jobs = []
         for path in self.folder.glob("*.json"):
-            if path.name.endswith(".proofread.json"):
-                continue
+            if path.name.endswith(_WORKING_FILES):
+                continue  # a job's working file, not a job
             try:
                 jobs.append(Job.from_dict(read_json(path)))
             except (ValueError, KeyError, TypeError, OSError) as exc:
@@ -227,6 +289,13 @@ class JobStore:
     def proofread_path(self, job: Job) -> Path:
         return self.folder / f"{job.job_id}.proofread.json"
 
+    def notes_path(self, job: Job) -> Path:
+        return self.folder / f"{job.job_id}.notes.json"
+
     def remove_working_files(self, job: Job) -> None:
-        self.segments_path(job).unlink(missing_ok=True)
-        self.proofread_path(job).unlink(missing_ok=True)
+        """Each file on its own: the job is finished, so one that cannot go is only logged."""
+        for path in (self.segments_path(job), self.proofread_path(job), self.notes_path(job)):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Could not remove the working file %s: %s", path.name, exc)
