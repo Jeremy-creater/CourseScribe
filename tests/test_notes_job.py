@@ -16,7 +16,6 @@ import shutil
 import string
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.request
@@ -72,7 +71,7 @@ from coursescribe.pipeline import (
 from coursescribe.platform import FILES_CAN_BE_HELD
 from coursescribe.proofread import OllamaProofreader
 from fake_ollama import FakeOllama
-from helpers import hold_without_sharing
+from helpers import DeniedFolder, Watchdog, deny_new_files, hold_without_sharing
 from notes_replies import META, make_reply
 from test_controller import FakeTranscriber as RigTranscriber
 from test_controller import Rig, _job_records_fail, _snapshot, _u16
@@ -216,23 +215,17 @@ def retry(job: Job) -> Job:
 
 
 class DiskFault:
-    """The system refuses new files in ``folder`` only (disk full, read-only); elsewhere files are made for real."""
+    """The system refuses new files in ``folder`` only (disk full, read-only); elsewhere files are made for real.
+
+    The refusal is injected at ``os.open``, the call that really creates the file, so a retry loop
+    around it runs as it would on a real refusal."""
 
     def __init__(self, monkeypatch, folder: Path, error: OSError) -> None:
         self.folder = folder
-        self.error: OSError | None = error
-        real = tempfile.mkstemp
-
-        def mkstemp(*args, **kwargs):
-            where = kwargs.get("dir")
-            if self.error is not None and where is not None and Path(where) == self.folder:
-                raise type(self.error)(*self.error.args)
-            return real(*args, **kwargs)
-
-        monkeypatch.setattr("coursescribe.files.tempfile.mkstemp", mkstemp)
+        self.denied = DeniedFolder(monkeypatch, folder, error)
 
     def fix(self) -> None:
-        self.error = None
+        self.denied.fix()
 
 
 def same_file(a: Path, b: Path) -> bool:
@@ -2303,36 +2296,6 @@ def test_an_md_really_held_by_another_program(tmp_path, svc):
     assert md.read_bytes() == SRC_BYTES
 
 
-class deny_new_files:  # noqa: N801  used like a function, as a context manager
-    """Make ``folder`` refuse new files for real: an ACL on Windows, permissions elsewhere."""
-
-    def __init__(self, folder: Path) -> None:
-        self.folder = folder
-
-    def __enter__(self):
-        if os.name == "nt":
-            user = os.environ.get("USERNAME", "")
-            subprocess.run(["icacls", str(self.folder), "/deny", f"{user}:(WD,AD)"], check=True, capture_output=True)
-        else:
-            self.mode = self.folder.stat().st_mode
-            self.folder.chmod(0o555)
-        probe = self.folder / "probe.tmp"
-        try:
-            probe.write_bytes(b"x")
-        except OSError:
-            return self
-        probe.unlink()
-        self.__exit__()
-        pytest.fail(f"Could not make {self.folder} read-only for this test")
-
-    def __exit__(self, *args):
-        if os.name == "nt":
-            user = os.environ.get("USERNAME", "")
-            subprocess.run(["icacls", str(self.folder), "/remove:d", user], check=True, capture_output=True)
-        else:
-            self.folder.chmod(self.mode)
-
-
 @pytest.mark.gui
 def test_a_really_read_only_folder(tmp_path, svc):
     """G2."""
@@ -2340,9 +2303,12 @@ def test_a_really_read_only_folder(tmp_path, svc):
     folder = md.parent
     store = JobStore(tmp_path / "state")
     job = new_job(store, md)
-    with deny_new_files(folder):
-        Flow(store, svc.writer()).run(job)
+    with Watchdog() as dog, deny_new_files(folder):  # leaving: the rights come back first, then the join
+        started = time.perf_counter()
+        dog.run(10, Flow(store, svc.writer()).run, job)
+        took = time.perf_counter() - started
         assert job.stage is Stage.FAILED and job.message == NOTES_WRITE_FAILED.format(folder=folder)
         assert names(folder) == sorted([md.name, f"{NAME}.txt"])
+        assert took < 2
     Flow(store, svc.writer()).run(retry(job))
     assert job.stage is Stage.DONE and len(svc.gens) == 1

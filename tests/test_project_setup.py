@@ -152,6 +152,22 @@ def test_pyqt_is_never_used():
     assert offenders == []
 
 
+
+def _names_tempfile(path: Path) -> bool:
+    """``import tempfile``, ``from tempfile import …``, or the name as a string (``import_module``)."""
+    if any(name.split(".")[0] == "tempfile" for name in _imported_modules(path)):
+        return True
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return any(isinstance(node, ast.Constant) and node.value == "tempfile" for node in ast.walk(tree))
+
+
+def test_program_code_never_imports_tempfile():
+    offenders = [p.name for p in SRC.rglob("*.py") if _names_tempfile(p)]
+    assert offenders == [], (
+        f"{offenders}: on Windows tempfile retries without end in a folder that refuses new files; "
+        "see docs/plans/M2-write-permission-hang-tests.md"
+    )
+
 def _tracked_files() -> list[str]:
     done = subprocess.run(
         ["git", "ls-files", "-z"], capture_output=True, cwd=REPO, check=True

@@ -8,7 +8,7 @@ import functools
 import json
 import logging
 import os
-import tempfile
+import secrets
 import time
 import unicodedata
 from collections.abc import Callable
@@ -24,6 +24,15 @@ _REPLACE_WAIT = 0.05  # seconds; one second in all is far longer than a reader h
 # Where a held file shuts others out, it is reported the same way as a real refusal
 # (reads do not even carry the Windows error code), so every refusal gets a short wait.
 _FILES_CAN_BE_HELD = FILES_CAN_BE_HELD
+
+# Not tempfile.mkstemp: on Windows it retries a refused creation up to two billion times, so a folder
+# that denies new files hung the program. A clash or a refusal (a file of that name being deleted)
+# gets a new random name, at most this many tries in all; the last error is raised.
+_CREATE_TRIES = 10
+# The name is ".coursescribe-" + 8 random characters + ".tmp", 26 in all, as the path budget in jobs.py expects.
+_TEMP_PREFIX = ".coursescribe-"
+_TEMP_SUFFIX = ".tmp"
+_CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
 
 
 def _numbered(path: Path, number: int) -> Path:
@@ -54,10 +63,22 @@ def unique_dir(path: Path) -> Path:
             number += 1
 
 
+def _create_temp(folder: Path) -> tuple[int, Path]:
+    """Create a new, empty temporary file in ``folder`` that only we can read; give up after a few tries."""
+    tries = 0
+    while True:
+        tries += 1
+        temp = folder / f"{_TEMP_PREFIX}{secrets.token_hex(4)}{_TEMP_SUFFIX}"
+        try:
+            return os.open(temp, _CREATE_FLAGS, 0o600), temp
+        except (FileExistsError, PermissionError):
+            if tries >= _CREATE_TRIES:
+                raise  # the last error: no waiting, a new name is all a clash or a passing refusal needs
+
+
 def _write_temp(folder: Path, data: bytes) -> Path:
     """Write ``data`` durably to a temporary file in ``folder``."""
-    descriptor, name = tempfile.mkstemp(dir=folder, prefix=".coursescribe-", suffix=".tmp")
-    temp = Path(name)
+    descriptor, temp = _create_temp(folder)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(data)
