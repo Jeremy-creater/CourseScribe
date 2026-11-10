@@ -252,6 +252,17 @@ class JobStore:
     def save(self, job: Job) -> None:
         atomic_write_json(self.folder / f"{job.job_id}.json", job.to_dict())
 
+    def load(self, job_id: str) -> Job | None:
+        """One job as it is on disk now; None when it is gone or damaged (damaged is logged, as in load_all)."""
+        path = self.folder / f"{job_id}.json"
+        try:
+            return Job.from_dict(read_json(path))
+        except FileNotFoundError:
+            return None
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            logger.warning("Ignoring damaged job state %s: %s", path.name, exc)
+            return None
+
     def load_all(self) -> list[Job]:
         if not self.folder.is_dir():
             return []

@@ -167,6 +167,7 @@ class Rig:
         self.download_error = None
         self.states = []
         self.awake = FakeKeepAwake()
+        self.stopping = threading.Event()
         self.controller = AppController(
             store=self.store,
             settings=self.settings,
@@ -174,7 +175,7 @@ class Rig:
             proofreader=self.proofreader,
             open_capture=open_capture or (lambda: FakeCapture(capture_fails)),
             download_model=self._download,
-            stopping=threading.Event(),
+            stopping=self.stopping,
             keep_awake=self.awake,
             now=lambda: NOW,
             notes_writer=notes_writer,

@@ -32,7 +32,8 @@ class Settings:
     output_dir: Path
     transcribe_model: str
     proofread_model: str
-    notes_model: str = DEFAULT_NOTES_MODEL  # only in memory for now; saving it comes with the settings window
+    notes_model: str = DEFAULT_NOTES_MODEL
+    auto_notes: bool = False  # organised notes made by themselves once a proofread .md is written
 
 
 def _parts(path: str | Path | None) -> tuple[str, ...] | None:
@@ -113,12 +114,34 @@ class SettingsStore:
     def load(self) -> Settings:
         try:
             raw = read_json(self.path)
-            return Settings(self._folder(raw), _text(raw["transcribe_model"]), _text(raw["proofread_model"]))
+            folder = self._folder(raw)
+            transcribe, proofread = _text(raw["transcribe_model"]), _text(raw["proofread_model"])
         except FileNotFoundError:
             return self.defaults
         except (ValueError, KeyError, TypeError, OSError) as exc:
             logger.warning("Using default settings: %s", exc)
             return self.defaults
+        # Added later, one by one: a file without them is an older version's, and one gone wrong
+        # costs only itself, not the folder and models the user chose.
+        return Settings(folder, transcribe, proofread, self._notes_model(raw), self._auto_notes(raw))
+
+    def _notes_model(self, raw: dict) -> str:
+        if "notes_model" not in raw:
+            return self.defaults.notes_model
+        value = raw["notes_model"]
+        if isinstance(value, str) and value.strip():
+            return value
+        logger.warning("Using the default notes_model: the saved one is %r", value)
+        return self.defaults.notes_model
+
+    def _auto_notes(self, raw: dict) -> bool:
+        if "auto_notes" not in raw:
+            return self.defaults.auto_notes
+        value = raw["auto_notes"]
+        if type(value) is bool:  # not isinstance: 1 and 0 are ints that pass as bools
+            return value
+        logger.warning("Using the default auto_notes: the saved one is %r", value)
+        return self.defaults.auto_notes
 
     def _folder(self, raw: dict) -> Path:
         if "output_dir" not in raw:
@@ -141,6 +164,9 @@ class SettingsStore:
             "format": _FORMAT,
             "transcribe_model": settings.transcribe_model,
             "proofread_model": settings.proofread_model,
+            # new keys need no new format: older versions read only the keys they know
+            "notes_model": settings.notes_model,
+            "auto_notes": settings.auto_notes,
         }
         if not _same_folder(settings.output_dir, self.defaults.output_dir):
             data["output_dir"] = str(settings.output_dir)

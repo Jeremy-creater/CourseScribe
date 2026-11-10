@@ -14,8 +14,10 @@ from PySide6.QtCore import QLockFile, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from coursescribe.controller import MEDIA_SUFFIXES, AppController
+from coursescribe.controller import MEDIA_SUFFIXES, AppController, KeepAwake
 from coursescribe.jobs import JobStore
+from coursescribe.notes_rules import load_notes_rules, rules_path
+from coursescribe.notes_writer import OllamaNotesWriter
 from coursescribe.ollama import OllamaClient, OllamaError
 from coursescribe.platform import (
     HOTKEY_LABEL,
@@ -81,6 +83,22 @@ def _list_proofread_models() -> list[str]:
         return []
 
 
+def build_controller(home: Path, stopping: threading.Event, keep_awake: KeepAwake | None = None) -> AppController:
+    """The application behind the window. ``keep_awake`` is for tests that must not ask the system."""
+    word_list = home / WORD_LIST_FILE
+    return AppController(
+        store=JobStore(home / "jobs"),
+        settings=open_settings(home / "settings.json"),
+        transcriber=WhisperTranscriber(should_stop=stopping.is_set),
+        proofreader=OllamaProofreader(vocabulary=lambda: load_vocabulary(word_list)),
+        open_capture=open_system_audio,
+        download_model=download_whisper_model,
+        stopping=stopping,
+        keep_awake=keep_awake if keep_awake is not None else create_keep_awake(),
+        notes_writer=OllamaNotesWriter(rules=lambda: load_notes_rules(rules_path())),
+    )
+
+
 def run() -> int:
     home = app_home()
     home.mkdir(parents=True, exist_ok=True)
@@ -97,17 +115,7 @@ def run() -> int:
         return 0
 
     stopping = threading.Event()
-    word_list = home / WORD_LIST_FILE
-    controller = AppController(
-        store=JobStore(home / "jobs"),
-        settings=open_settings(home / "settings.json"),
-        transcriber=WhisperTranscriber(should_stop=stopping.is_set),
-        proofreader=OllamaProofreader(vocabulary=lambda: load_vocabulary(word_list)),
-        open_capture=open_system_audio,
-        download_model=download_whisper_model,
-        stopping=stopping,
-        keep_awake=create_keep_awake(),
-    )
+    controller = build_controller(home, stopping)
     install_error_reporting(controller.report_unexpected_error)
     window = None
 
@@ -122,7 +130,8 @@ def run() -> int:
         confirm=confirm,
         open_folder=lambda folder: QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))),
         list_proofread_models=_list_proofread_models,
-        word_list=word_list,
+        word_list=home / WORD_LIST_FILE,
+        notes_rules=rules_path(),
     )
     hotkey = create_global_hotkey(window.hotkey_pressed.emit)
     if not hotkey.start():

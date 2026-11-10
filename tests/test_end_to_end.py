@@ -68,3 +68,87 @@ def test_local_file_becomes_txt_and_proofread_md(tmp_path):
     assert is_lossless(clean_fillers(raw), body)
     assert "索引" in body and "#" not in body
     print("\nTXT:", raw, "\nMD:", proofread)
+
+
+def test_with_auto_notes_on_a_real_lesson_goes_on_to_its_notes_one_model_at_a_time(tmp_path, monkeypatch):
+    """12-7 I1: the program's own assembly, from the settings file to the notes, on the real models."""
+    import json
+    from datetime import date
+
+    from coursescribe.jobs import JobKind
+    from coursescribe.models import DEFAULT_PROOFREAD_MODEL, DEFAULT_TRANSCRIBE_MODEL
+    from coursescribe.notes import NotesMeta, lecture_date
+    from coursescribe.ui.app import build_controller
+    from test_notes import header
+    from test_notes_job import _loaded_models
+    from test_proofread import _ready_notes_model
+
+    client = OllamaClient()
+    _ready_notes_model(client)
+    if DEFAULT_PROOFREAD_MODEL not in client.models():
+        pytest.fail(f"Model {DEFAULT_PROOFREAD_MODEL} is missing. Run: ollama pull {DEFAULT_PROOFREAD_MODEL}")
+    prepare_gpu_libraries()
+    source = speak_to_wav(LESSON, tmp_path / "lesson.wav")
+    home = tmp_path / "家"
+    home.mkdir()
+    monkeypatch.setenv("COURSESCRIBE_HOME", str(home))
+    (home / "settings.json").write_text(
+        json.dumps({"format": 2, "output_dir": str(tmp_path / "out"), "transcribe_model": DEFAULT_TRANSCRIBE_MODEL,
+                    "proofread_model": DEFAULT_PROOFREAD_MODEL, "auto_notes": True}),
+        encoding="utf-8",
+    )
+    stopping = threading.Event()
+    controller = build_controller(home, stopping)
+    loaded: list[list[str]] = []
+    watching = threading.Event()
+    watching.set()
+
+    def watch():
+        while watching.is_set():
+            loaded.append(_loaded_models())
+            time.sleep(0.5)
+
+    kept: dict = {}
+
+    def keep(state):
+        if not kept and state.status == "完成":
+            job = next(j for j in controller.store.load_all() if j.kind is not JobKind.NOTES)
+            kept.update(txt=job.txt_path.read_bytes(), md=job.md_path.read_bytes())
+
+    controller.add_listener(keep)
+    watcher = threading.Thread(target=watch, daemon=True)
+    started = time.time()
+    try:
+        watcher.start()
+        controller.start()
+        controller.add_files([source])
+        deadline = time.time() + 900
+        while time.time() < deadline:
+            jobs = controller.store.load_all()
+            if len(jobs) == 2 and all(j.stage in (Stage.DONE, Stage.FAILED, Stage.WAITING_NOTES) for j in jobs) \
+                    and controller.state.pending == 0:
+                break
+            time.sleep(0.5)
+    finally:
+        watching.clear()
+        watcher.join(15)
+        controller.shutdown()
+    took = time.time() - started
+
+    jobs = controller.store.load_all()
+    lesson_job = next(j for j in jobs if j.kind is not JobKind.NOTES)
+    notes_job = next(j for j in jobs if j.kind is JobKind.NOTES)
+    assert lesson_job.stage is Stage.DONE, lesson_job.message
+    assert notes_job.stage is Stage.DONE, notes_job.message
+    md = lesson_job.md_path
+    notes = md.with_name(f"{md.stem}-整理笔记.md")
+    made_on = date.fromtimestamp(notes_job.created_ns / 1e9)
+    assert notes.read_text(encoding="utf-8").startswith(header(NotesMeta(md.stem, lecture_date(md.stem, made_on))))
+    assert all(len(models) <= 1 for models in loaded), loaded
+    deadline = time.time() + 10
+    while _loaded_models() and time.time() < deadline:
+        time.sleep(0.5)
+    assert _loaded_models() == []
+    assert (lesson_job.txt_path.read_bytes(), md.read_bytes()) == (kept["txt"], kept["md"])
+    print(f"\nremoved quotes: {notes_job.removed_quotes}, removed concepts: {notes_job.removed_concepts}, "
+          f"took {took:.0f} s")

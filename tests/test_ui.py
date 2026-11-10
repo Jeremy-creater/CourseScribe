@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import random
 import time
+from dataclasses import replace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -28,7 +30,7 @@ def qt_app():
 
 
 class Screen:
-    def __init__(self, tmp_path, qt_app):
+    def __init__(self, tmp_path, qt_app, notes_rules=None):
         self.qt_app = qt_app
         self.rig = Rig(tmp_path)
         self.chosen: list = []
@@ -41,6 +43,7 @@ class Screen:
             confirm=self._confirm,
             open_folder=self._open,
             list_proofread_models=lambda: ["model-a", "model-b"],
+            notes_rules=notes_rules,
         )
         self.opened: list = []
         self.window.show()
@@ -444,3 +447,248 @@ class TestWordList:
         assert opened == [path]
         assert path.read_text(encoding="utf-8") == TEMPLATE
         assert dialog.word_note.text() == usual
+
+
+
+# ---------------------------------------------------------------- notes settings (12-7)
+
+
+def _items(box) -> list[str]:
+    return [box.itemText(i) for i in range(box.count())]
+
+
+class TestNotesSettings:
+    def test_shows_the_current_notes_settings(self, tmp_path, qt_app):
+        """D1 (a)-(d)."""
+        from coursescribe.models import DEFAULT_NOTES_MODEL
+        from coursescribe.ui.settings_dialog import AUTO_NOTES_TEXT, RULES_NOTE
+
+        dialog = SettingsDialog(Settings(tmp_path, "large-v3", "model-a", "model-b", True), ["model-b", "model-a", "model-a"])
+        assert dialog.notes_box.currentText() == "model-b"
+        assert _items(dialog.notes_box) == _items(dialog.proofread_box) == ["model-a", "model-b"]
+        assert dialog.notes_box.isEditable()
+        assert dialog.auto_notes_box.isChecked()
+        assert dialog.auto_notes_box.text() == AUTO_NOTES_TEXT
+        assert dialog.proofread_box.currentText() == "model-a"
+
+        dialog = SettingsDialog(Settings(tmp_path, "large-v3", "model-a", "我的-模型:latest"), ["model-a"])
+        assert dialog.notes_box.currentText() == "我的-模型:latest"
+
+        dialog = SettingsDialog(Settings(tmp_path, "large-v3", "model-a", "model-c"), [])
+        assert dialog.notes_box.currentText() == "model-c"
+        assert dialog.notes_box.isEditable()
+        dialog.notes_box.setCurrentText("手打的模型")
+        assert dialog.notes_box.currentText() == "手打的模型"
+
+        opened = []
+        home = tmp_path / "home"
+        dialog = SettingsDialog(
+            Settings(tmp_path, "large-v3", "model-a"), ["model-a"],
+            notes_rules=home / "整理规则.txt", open_file=opened.append,
+        )
+        assert dialog.notes_box.currentText() == DEFAULT_NOTES_MODEL
+        assert not dialog.auto_notes_box.isChecked()
+        assert dialog.rules_button.text() == "打开整理规则…"
+        assert dialog.rules_button.isEnabled()
+        assert dialog.rules_note.text() == RULES_NOTE
+        assert not home.exists()
+        assert opened == []
+
+    @pytest.mark.parametrize(
+        "typed, model",
+        [("model-a", "model-a"), ("  qwen3:8b  ", "qwen3:8b"), ("", "qwen3.5:9b"), ("   ", "qwen3.5:9b")],
+    )
+    @pytest.mark.parametrize("checked", [True, False])
+    def test_returns_the_changed_notes_settings(self, tmp_path, qt_app, typed, model, checked):
+        """D2."""
+        from coursescribe.models import DEFAULT_NOTES_MODEL
+
+        assert DEFAULT_NOTES_MODEL == "qwen3.5:9b"
+        current = Settings(tmp_path / "out", "small", "model-b", "model-c", not checked)
+        dialog = SettingsDialog(current, ["model-a", "model-b"], choose_folder=lambda: None)
+        dialog.notes_box.setCurrentText(typed)
+        dialog.auto_notes_box.setChecked(checked)
+        result = dialog.result_settings()
+        assert result.notes_model == model
+        assert result.auto_notes is checked
+
+        dialog = SettingsDialog(current, ["model-a", "model-b"], choose_folder=lambda: None)
+        dialog.auto_notes_box.setChecked(checked)
+        assert dialog.result_settings() == replace(current, auto_notes=checked)
+        assert type(dialog.result_settings().auto_notes) is bool
+
+    def test_opening_and_saving_unchanged_gives_the_same_settings(self, tmp_path, qt_app):
+        """D3."""
+        from coursescribe.models import MODELS
+
+        rng = random.Random(20270406)
+        pool = ["qwen3.5:9b", "gemma4:12b", "我的 模型", "x:y"]
+        for round_ in range(40):
+            folder = tmp_path.joinpath(*(rng.choice(["课程", "资料 2", "甲乙丙", "网课-第3讲"]) for _ in range(rng.randint(1, 3))))
+            current = Settings(folder, rng.choice(list(MODELS)), rng.choice(pool), rng.choice(pool), rng.random() < 0.5)
+            listed = {name for name in pool if rng.random() < 0.5}
+            for name in (current.proofread_model, current.notes_model):
+                if rng.random() < 0.3:
+                    listed.discard(name)
+                else:
+                    listed.add(name)
+            dialog = SettingsDialog(current, sorted(listed), choose_folder=lambda: None)
+            assert dialog.result_settings() == current, (round_, current, listed)
+
+    @pytest.mark.parametrize("case", ["missing", "gbk", "folder", "disk-full", "after-disk-full", "twice", "not-given"])
+    def test_the_rules_button(self, tmp_path, qt_app, monkeypatch, case):
+        """D4 (a)-(g)."""
+        from coursescribe.notes_rules import RULES_CREATE_FAILED, RULES_FOLDER_IN_THE_WAY, SHIPPED_RULES
+        from coursescribe.ui.settings_dialog import RULES_NOTE, WORD_NOTE
+
+        def no_space(descriptor):
+            raise OSError(28, "No space left on device")
+
+        opened = []
+        path = tmp_path / "home" / "整理规则.txt"
+        if case == "gbk":
+            path.parent.mkdir()
+            path.write_bytes("// 说明\r\n每节写案例\r\n".encode("gbk"))
+            before = (path.read_bytes(), path.stat().st_mtime_ns)
+        elif case == "folder":
+            path.mkdir(parents=True)
+        if case == "not-given":
+            for links in ({"open_file": opened.append}, {"notes_rules": path}):
+                dialog = SettingsDialog(Settings(tmp_path, "large-v3", "model-a"), ["model-a"], **links)
+                assert not dialog.rules_button.isEnabled()
+                assert dialog.rules_note.wordWrap()
+                dialog._open_rules()  # reached some other way than the disabled button: still nothing
+                assert dialog.rules_note.text() == RULES_NOTE
+            assert opened == []
+            assert not path.parent.exists()
+            return
+        dialog = SettingsDialog(
+            Settings(tmp_path, "large-v3", "model-a"), ["model-a"], choose_folder=lambda: None,
+            word_list=tmp_path / "词表.txt", notes_rules=path, open_file=opened.append,
+        )
+        assert dialog.rules_note.wordWrap()
+        if case in ("disk-full", "after-disk-full"):
+            monkeypatch.setattr("coursescribe.files.os.fsync", no_space)
+        dialog.rules_button.click()
+        if case == "missing":
+            assert opened == [path]
+            assert path.read_bytes() == SHIPPED_RULES.read_bytes()
+            assert dialog.rules_note.text() == RULES_NOTE
+        elif case == "gbk":
+            assert opened == [path]
+            assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+            assert dialog.rules_note.text() == RULES_NOTE
+        elif case == "folder":
+            assert opened == []
+            assert dialog.rules_note.text() == RULES_FOLDER_IN_THE_WAY.format(path=path)
+            assert path.is_dir() and list(path.iterdir()) == []
+        elif case in ("disk-full", "after-disk-full"):
+            assert opened == []
+            assert dialog.rules_note.text() == RULES_CREATE_FAILED.format(path=path)
+            assert not path.exists()
+            assert not path.parent.exists() or list(path.parent.iterdir()) == []
+            if case == "after-disk-full":
+                monkeypatch.undo()
+                dialog.rules_button.click()
+                assert opened == [path]
+                assert path.read_bytes() == SHIPPED_RULES.read_bytes()
+                assert dialog.rules_note.text() == RULES_NOTE
+        elif case == "twice":
+            assert opened == [path]
+            first = (path.read_bytes(), path.stat().st_mtime_ns)
+            time.sleep(0.02)
+            dialog.rules_button.click()
+            assert opened == [path, path]
+            assert (path.read_bytes(), path.stat().st_mtime_ns) == first
+            assert dialog.rules_note.text() == RULES_NOTE
+        assert dialog.rules_note.wordWrap()
+        assert dialog.word_note.text() == WORD_NOTE
+        assert not (tmp_path / "词表.txt").exists()
+
+
+def _driven(script, code):
+    """The real settings window, with exec() doing what a user would and then pressing Save (1) or Cancel (0)."""
+
+    class Driven(SettingsDialog):
+        def exec(self):
+            script(self)
+            return code
+
+    return Driven
+
+
+def _check_and_pick_b(dialog):
+    dialog.auto_notes_box.setChecked(True)
+    dialog.notes_box.setCurrentText("model-b")
+
+
+def test_the_main_window_saves_notes_settings_only_on_save_and_opens_the_rules(tmp_path, qt_app, monkeypatch):
+    """D5 (a)-(d)."""
+    from coursescribe.notes_rules import SHIPPED_RULES
+    from coursescribe.settings import SettingsStore
+    from coursescribe.ui import main_window
+
+    rules = tmp_path / "home" / "整理规则.txt"
+    made = Screen(tmp_path, qt_app, notes_rules=rules)
+    made.rig.controller.start()
+    try:
+        controller = made.rig.controller
+        settings_file = tmp_path / "settings.json"
+        first = controller.settings
+
+        monkeypatch.setattr(main_window, "SettingsDialog", _driven(_check_and_pick_b, 0))
+        made.window.settings_button.click()
+        assert controller.settings == first
+        assert not settings_file.exists()
+        assert not rules.exists() and made.opened == []
+
+        monkeypatch.setattr(main_window, "SettingsDialog", _driven(lambda dialog: dialog.rules_button.click(), 0))
+        made.window.settings_button.click()
+        assert made.opened == [rules]
+        assert rules.read_bytes() == SHIPPED_RULES.read_bytes()
+        assert controller.settings == first
+        assert not settings_file.exists()
+
+        monkeypatch.setattr(main_window, "SettingsDialog", _driven(_check_and_pick_b, 1))
+        made.window.settings_button.click()
+        assert controller.settings.auto_notes is True and controller.settings.notes_model == "model-b"
+        loaded = SettingsStore(settings_file, made.rig.settings.defaults).load()
+        assert loaded.auto_notes is True and loaded.notes_model == "model-b"
+        saved = settings_file.read_bytes()
+
+        seen = []
+        monkeypatch.setattr(
+            main_window, "SettingsDialog",
+            _driven(lambda dialog: seen.append((dialog.auto_notes_box.isChecked(), dialog.notes_box.currentText())), 1),
+        )
+        made.window.settings_button.click()
+        assert seen == [(True, "model-b")]
+        assert settings_file.read_bytes() == saved
+    finally:
+        made.close()
+
+
+def test_settings_that_cannot_be_saved_are_explained_in_the_window(tmp_path, qt_app, monkeypatch):
+    """D6."""
+    from coursescribe.controller import SETTINGS_NOT_SAVED
+    from coursescribe.ui import main_window
+    from test_notes_job import DiskFault
+
+    made = Screen(tmp_path, qt_app, notes_rules=tmp_path / "home" / "整理规则.txt")
+    made.rig.controller.start()
+    try:
+        controller = made.rig.controller
+        settings_file = tmp_path / "settings.json"
+        controller.update_settings(controller.settings)
+        before = settings_file.read_bytes()
+        DiskFault(monkeypatch, tmp_path, OSError(28, "No space left on device"))
+        monkeypatch.setattr(main_window, "SettingsDialog", _driven(_check_and_pick_b, 1))
+        made.window.settings_button.click()
+        expected = SETTINGS_NOT_SAVED.format(path=settings_file)
+        made.wait(lambda: made.window.notice_label.isVisible())
+        assert made.window.notice_label.text() == expected
+        assert controller.settings.auto_notes is True
+        assert not any("程序出了点意外" in state.notice for state in made.rig.states)
+        assert settings_file.read_bytes() == before
+    finally:
+        made.close()

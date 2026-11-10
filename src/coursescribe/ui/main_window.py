@@ -47,6 +47,7 @@ class MainWindow(QWidget):
         open_folder: Callable[[Path], None],
         list_proofread_models: Callable[[], Iterable[str]],
         word_list: Path | None = None,
+        notes_rules: Path | None = None,
     ) -> None:
         super().__init__()
         self.controller = controller
@@ -55,6 +56,7 @@ class MainWindow(QWidget):
         self._open_folder = open_folder
         self._list_proofread_models = list_proofread_models
         self._word_list = word_list
+        self._notes_rules = notes_rules
         self.setWindowTitle("CourseScribe")
         self.setObjectName("mainWindow")
         self.setAcceptDrops(True)
@@ -192,6 +194,7 @@ class MainWindow(QWidget):
             parent=self,
             word_list=self._word_list,
             open_file=self._open_folder,  # the system opens a file the same way as a folder
+            notes_rules=self._notes_rules,
         )
         if dialog.exec():
             self.controller.update_settings(dialog.result_settings())

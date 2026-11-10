@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import itertools
+import logging
+import random
 import time
 import unicodedata
 from datetime import datetime
@@ -339,3 +341,67 @@ def test_longest_path_fits(tmp_path):
         assert _u16(str(written)) == 259
     assert written.read_text(encoding="utf-8") == "内容"
     assert not [p for p in job.folder.iterdir() if p.suffix == ".tmp"]
+
+
+def _folder_contents(folder: Path) -> dict[str, tuple[bytes, int]]:
+    if not folder.is_dir():
+        return {}
+    return {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in folder.iterdir()}
+
+
+def test_loading_one_job_agrees_with_loading_all_and_logs_a_damaged_record_once(tmp_path, caplog):
+    """J1 (12-7): load(id) and load_all() agree on any folder; a damaged record is one warning per read."""
+    from test_notes_job import _random_job
+
+    def warnings() -> list[logging.LogRecord]:
+        return [r for r in caplog.records if r.levelno == logging.WARNING and r.name == "coursescribe.jobs"]
+
+    rng = random.Random(20270404)
+    damaged_rounds = 0
+    with caplog.at_level(logging.WARNING, logger="coursescribe.jobs"):
+        for round_ in range(30):
+            root = tmp_path / f"r{round_}"
+            store = JobStore(root / "state")
+            ids = []
+            for index in range(rng.randint(0, 5)):
+                job = _random_job(rng, root, index)
+                store.save(job)
+                ids.append(job.job_id)
+                for suffix in (".notes.json", ".proofread.json"):
+                    if rng.random() < 0.5:
+                        (store.folder / f"{job.job_id}{suffix}").write_text('{"reply": "x"}', encoding="utf-8")
+            broken = None
+            if ids and rng.random() < 0.5:
+                broken = rng.choice(ids)
+                (store.folder / f"{broken}.json").write_bytes(b"{")
+                damaged_rounds += 1
+            before = _folder_contents(store.folder)
+
+            caplog.clear()
+            everything = {job.job_id: job for job in store.load_all()}
+            caplog.clear()
+            one_by_one = {}
+            for job_id in ids:
+                count = len(warnings())
+                loaded = store.load(job_id)
+                added = warnings()[count:]
+                if job_id == broken:
+                    assert loaded is None, round_
+                    assert len(added) == 1 and f"{job_id}.json" in added[0].getMessage(), round_
+                else:
+                    assert loaded is not None, round_
+                    assert added == [], round_
+                    one_by_one[job_id] = loaded
+            assert one_by_one == everything, round_
+            caplog.clear()
+            assert store.load("不存在") is None
+            assert warnings() == []
+            assert _folder_contents(store.folder) == before, round_
+    assert damaged_rounds >= 5
+
+    missing = JobStore(tmp_path / "nowhere" / "state")
+    with caplog.at_level(logging.WARNING, logger="coursescribe.jobs"):
+        caplog.clear()
+        assert missing.load("abc") is None
+        assert warnings() == []
+    assert not (tmp_path / "nowhere").exists()

@@ -6,13 +6,15 @@ import itertools
 import json
 import logging
 import os
+import random
 import unicodedata
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 import coursescribe.settings as settings_module
-from coursescribe.models import DEFAULT_PROOFREAD_MODEL, DEFAULT_TRANSCRIBE_MODEL
+from coursescribe.models import DEFAULT_NOTES_MODEL, DEFAULT_PROOFREAD_MODEL, DEFAULT_TRANSCRIBE_MODEL
 from coursescribe.settings import Settings, SettingsStore, choose_output_dir, default_settings, open_settings
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -333,6 +335,173 @@ def test_damaged_settings_fall_back_to_defaults_with_a_warning(tmp_path, caplog,
         assert SettingsStore(path, defaults).load() == defaults
     assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
     assert path.read_bytes() == before
+
+
+# ---- the notes model and the auto-notes switch (12-7) ----------------------------------
+
+_MODEL_NAMES = ["qwen3.5:9b", "gemma4:12b", "my model:latest", "模型-甲", "a" * 300, "x/y:z"]
+
+
+def _warnings(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.levelno == logging.WARNING and r.name == "coursescribe.settings"]
+
+
+def _random_settings(rng, tmp_path, defaults: Settings) -> Settings:
+    folder = rng.choice([defaults.output_dir, tmp_path / "D盘" / "课", tmp_path / "OneDrive" / "x"])
+    return Settings(
+        folder, rng.choice(_MODEL_NAMES), rng.choice(_MODEL_NAMES), rng.choice(_MODEL_NAMES), rng.random() < 0.5
+    )
+
+
+def test_any_settings_with_the_notes_model_and_switch_survive_saving_and_loading(tmp_path):
+    """S1: the round trip, and saving what was loaded writes the same bytes."""
+    rng = random.Random(20270401)
+    defaults = Settings(tmp_path / "Documents" / "CourseScribe", "large-v3", "m")
+    for round_ in range(200):
+        settings = _random_settings(rng, tmp_path, defaults)
+        path = tmp_path / f"settings-{round_}.json"
+        SettingsStore(path, defaults).save(settings)
+        first = path.read_bytes()
+        loaded = SettingsStore(path, defaults).load()
+        assert loaded == settings, (round_, settings)
+        assert type(loaded.auto_notes) is bool, round_
+        saved = json.loads(first.decode("utf-8"))
+        assert saved["format"] == 2, round_
+        assert (saved.get("notes_model"), saved.get("auto_notes")) == (settings.notes_model, settings.auto_notes), round_
+        SettingsStore(path, defaults).save(loaded)
+        assert path.read_bytes() == first, round_
+
+
+def test_settings_saved_before_the_notes_settings_read_as_before_without_a_warning(tmp_path, synced, caplog):
+    """S2: an old file, an older file without a format, and saved files missing any of the new keys."""
+    defaults = Settings(tmp_path / "CourseScribe", "large-v3", "m")
+    with caplog.at_level(logging.WARNING, logger="coursescribe.settings"):
+        path = tmp_path / "old.json"
+        before = _write(
+            path,
+            {"format": 2, "output_dir": str(tmp_path / "D盘" / "课"), "transcribe_model": "small",
+             "proofread_model": "qwen3:8b"},
+        )
+        assert SettingsStore(path, defaults).load() == Settings(
+            tmp_path / "D盘" / "课", "small", "qwen3:8b", DEFAULT_NOTES_MODEL, False
+        )
+        assert path.read_bytes() == before
+
+        docs, old_defaults = synced
+        path = tmp_path / "older.json"
+        before = _write(path, {"output_dir": str(docs / "CourseScribe"), "transcribe_model": "small",
+                               "proofread_model": "qwen3:8b"})
+        loaded = SettingsStore(path, old_defaults, old_default_dir=docs / "CourseScribe").load()
+        assert loaded == Settings(tmp_path / "CourseScribe", "small", "qwen3:8b", DEFAULT_NOTES_MODEL, False)
+        assert path.read_bytes() == before
+
+        rng = random.Random(20270402)
+        # defaults of their own, so a missing key is seen to take the store's default and not a constant
+        own = Settings(tmp_path / "Documents" / "CourseScribe", "large-v3", "m", "默认-笔记", True)
+        for round_ in range(50):
+            settings = _random_settings(rng, tmp_path, own)
+            path = tmp_path / f"partial-{round_}.json"
+            SettingsStore(path, own).save(settings)
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            dropped = [key for key in ("notes_model", "auto_notes") if rng.random() < 0.5]
+            for key in dropped:
+                raw.pop(key, None)
+            before = _write(path, raw)
+            expected = settings
+            if "notes_model" in dropped:
+                expected = replace(expected, notes_model=own.notes_model)
+            if "auto_notes" in dropped:
+                expected = replace(expected, auto_notes=own.auto_notes)
+            assert SettingsStore(path, own).load() == expected, (round_, dropped)
+            assert path.read_bytes() == before, round_
+    assert _warnings(caplog) == []
+
+
+_BAD = {"notes_model": [5, "", "   ", None, ["a"]], "auto_notes": [1, 0, "true", None, "yes"]}
+
+
+def _base_file(tmp_path) -> dict:
+    return {"format": 2, "output_dir": str(tmp_path / "D盘" / "课"), "transcribe_model": "small",
+            "proofread_model": "m2", "notes_model": "model-x", "auto_notes": True}
+
+
+def _check_bad_keys(tmp_path, caplog, path: Path, bad: dict, case) -> None:
+    defaults = Settings(tmp_path / "CourseScribe", "large-v3", "m")
+    before = _write(path, {**_base_file(tmp_path), **bad})
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="coursescribe.settings"):
+        loaded = SettingsStore(path, defaults).load()
+    expected = Settings(
+        tmp_path / "D盘" / "课", "small", "m2",
+        DEFAULT_NOTES_MODEL if "notes_model" in bad else "model-x",
+        False if "auto_notes" in bad else True,
+    )
+    assert loaded == expected, case
+    warnings = _warnings(caplog)
+    assert len(warnings) == len(bad), case
+    for key in bad:
+        assert sum(key in record.getMessage() for record in warnings) == 1, (case, key)
+    assert path.read_bytes() == before, case
+
+
+def test_a_damaged_notes_setting_falls_back_alone_and_damaged_old_settings_fall_back_whole(tmp_path, caplog):
+    """S3."""
+    number = 0
+    for key, values in _BAD.items():
+        for value in values:
+            number += 1
+            _check_bad_keys(tmp_path, caplog, tmp_path / f"bad-{number}.json", {key: value}, (key, value))
+    for notes, auto in itertools.product(_BAD["notes_model"], _BAD["auto_notes"]):
+        number += 1
+        both = {"notes_model": notes, "auto_notes": auto}
+        _check_bad_keys(tmp_path, caplog, tmp_path / f"bad-{number}.json", both, both)
+
+    rng = random.Random(20270403)
+    for round_ in range(60):
+        bad = {key: rng.choice(values) for key, values in _BAD.items() if rng.random() < 0.5}
+        _check_bad_keys(tmp_path, caplog, tmp_path / f"random-{round_}.json", bad, (round_, bad))
+
+    defaults = Settings(tmp_path / "CourseScribe", "large-v3", "m")
+    whole = [
+        {**_base_file(tmp_path), "output_dir": 5, "auto_notes": "yes"},
+        {key: value for key, value in {**_base_file(tmp_path), "notes_model": ""}.items() if key != "proofread_model"},
+    ]
+    for number, data in enumerate(whole):
+        path = tmp_path / f"whole-{number}.json"
+        before = _write(path, data)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="coursescribe.settings"):
+            assert SettingsStore(path, defaults).load() == defaults, data
+        assert len(_warnings(caplog)) == 1, data
+        assert path.read_bytes() == before, data
+
+
+def _load_as_before_12_7(store: SettingsStore) -> Settings:
+    """The reading of the version before this one, written out here: only the three keys it knew."""
+    raw = json.loads(store.path.read_text(encoding="utf-8"))
+    folder = Path(raw["output_dir"]) if "output_dir" in raw else store.defaults.output_dir
+    if not isinstance(raw["transcribe_model"], str) or not isinstance(raw["proofread_model"], str):
+        raise TypeError("Expected text")
+    return Settings(folder, raw["transcribe_model"], raw["proofread_model"])
+
+
+def test_saved_notes_settings_keep_the_format_and_the_older_version_still_reads_them(tmp_path):
+    """S4."""
+    defaults = Settings(tmp_path / "CourseScribe", "large-v3", "m")
+    path = tmp_path / "settings.json"
+    store = SettingsStore(path, defaults)
+    store.save(Settings(tmp_path / "D盘" / "课", "small", "m2", "model-x", True))
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["format"] == 2
+    assert _load_as_before_12_7(store) == Settings(tmp_path / "D盘" / "课", "small", "m2")
+    assert (saved.get("notes_model"), saved.get("auto_notes")) == ("model-x", True)
+
+    store.save(Settings(defaults.output_dir, "small", "m2", "模型-甲", False))
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert "output_dir" not in saved and saved["format"] == 2
+    assert (saved.get("notes_model"), saved.get("auto_notes")) == ("模型-甲", False)
+    assert "模型-甲".encode("utf-8") in path.read_bytes()
+    assert _load_as_before_12_7(store) == Settings(defaults.output_dir, "small", "m2")
 
 
 # ---- open_settings: everything put together ------------------------------------------
