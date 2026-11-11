@@ -15,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 
 from coursescribe.files import atomic_write_json, read_json, unique_dir
+from coursescribe.platform import LIMITS
 
 logger = logging.getLogger(__name__)
 
@@ -62,12 +63,36 @@ def _units(text: str) -> int:
     return len(text.encode("utf-16-le", "surrogatepass")) // 2
 
 
-def path_fits(path: Path) -> bool:
-    """Whether Windows can open ``path`` without long-path support."""
-    return _units(str(path)) <= PATH_LIMIT
+def _bytes(text: str) -> int:
+    return len(text.encode("utf-8", "surrogateescape"))
 
 
 NOTES_SUFFIX = "-整理笔记"
+# The longest name a job name ends up in: <name>-整理笔记 (99).md
+_NOTES_TAIL_BYTES = _bytes(f"{NOTES_SUFFIX} (99).md")
+
+
+def path_fits(path: Path) -> bool:
+    """Whether the system can store ``path``: Windows counts the whole path, the Mac each name and the whole path."""
+    text = str(path)
+    limits = LIMITS
+    if limits.path_units is not None and _units(text) > limits.path_units:
+        return False
+    if limits.path_bytes is not None and _bytes(text) > limits.path_bytes:
+        return False
+    if limits.component_bytes is not None and any(_bytes(part) > limits.component_bytes for part in path.parts):
+        return False
+    return True
+
+
+def _byte_budget(root: Path) -> int | None:
+    """The most UTF-8 bytes a job name may have on the Mac so every name and the longest path fit; None elsewhere."""
+    budgets = []
+    if LIMITS.component_bytes is not None:
+        budgets.append(LIMITS.component_bytes - _NOTES_TAIL_BYTES)
+    if LIMITS.path_bytes is not None:
+        budgets.append((LIMITS.path_bytes - _bytes(str(root)) - 2 - _NOTES_TAIL_BYTES) // 2)  # root/name/name+tail
+    return min(budgets) if budgets else None
 _NOTES_NAME = re.compile(re.escape(NOTES_SUFFIX) + r"( \(\d+\))?\.md$", re.IGNORECASE)
 
 
@@ -88,15 +113,19 @@ def _extends(char: str) -> bool:
 
 def job_name(raw: str, root: Path) -> str:
     """The name for a job's folder and files: ``raw`` cut so every path the job makes fits."""
-    limit = min(NAME_LIMIT, (_NAME_BUDGET - _units(str(root))) // 2)
-    if limit < MIN_NAME:
+    limit = NAME_LIMIT
+    if LIMITS.path_units is not None:
+        limit = min(limit, (LIMITS.path_units - 16 - _units(str(root))) // 2)
+    byte_limit = _byte_budget(root)
+    if limit < MIN_NAME or (byte_limit is not None and byte_limit < 3 * MIN_NAME):  # 3 bytes: a Chinese character
         raise SaveFolderTooLong(root)
     name = raw
-    if _units(raw) > limit:
-        end = units = 0
+    if _units(raw) > limit or (byte_limit is not None and _bytes(raw) > byte_limit):
+        end = units = size = 0
         for char in raw:
             units += _units(char)
-            if units > limit:
+            size += _bytes(char)
+            if units > limit or (byte_limit is not None and size > byte_limit):
                 break
             end += 1
         # never split a character from its marks; a space or dot cut off here could expose a joiner

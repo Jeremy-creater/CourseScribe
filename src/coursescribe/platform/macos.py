@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from coursescribe.platform.limits import PathLimits
+
 
 def open_system_audio():
     raise NotImplementedError("System audio capture on the Mac is not built yet")
@@ -15,6 +17,8 @@ def prepare_gpu_libraries() -> None:
 
 HOTKEY_LABEL = ""
 FILES_CAN_BE_HELD = False  # an open file never shuts others out; a refusal is real
+# The Mac counts each name (255 bytes) and the whole path (PATH_MAX 1024 less the terminating null) in UTF-8 bytes.
+LIMITS = PathLimits(path_units=None, component_bytes=255, path_bytes=1023)
 
 
 class _NoHotkey:

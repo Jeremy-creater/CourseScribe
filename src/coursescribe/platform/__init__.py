@@ -7,6 +7,7 @@ import sys
 if sys.platform == "win32":
     from coursescribe.platform.windows import (
         FILES_CAN_BE_HELD,
+        LIMITS,
         cloud_sync_roots,
         HOTKEY_LABEL,
         create_global_hotkey,
@@ -17,6 +18,7 @@ if sys.platform == "win32":
 else:
     from coursescribe.platform.macos import (
         FILES_CAN_BE_HELD,
+        LIMITS,
         cloud_sync_roots,
         HOTKEY_LABEL,
         create_global_hotkey,
@@ -27,6 +29,7 @@ else:
 
 __all__ = [
     "FILES_CAN_BE_HELD",
+    "LIMITS",
     "HOTKEY_LABEL",
     "cloud_sync_roots",
     "create_global_hotkey",
