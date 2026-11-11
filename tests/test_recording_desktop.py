@@ -104,8 +104,11 @@ def _default_output_may_change():
 
 def _two_enabled_outputs():
     """The current default A and another enabled device B, real hardware first."""
+    import ctypes
+
     import soundcard
 
+    ctypes.windll.ole32.CoInitializeEx(None, 0)  # this (main) thread has not started COM yet
     speakers = soundcard.all_speakers()  # enabled ones only
     a = soundcard.default_speaker()
     others = [speaker for speaker in speakers if speaker.id != a.id]
