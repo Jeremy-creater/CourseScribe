@@ -117,9 +117,9 @@ def links_resolve_once(result: str, name: str) -> list[str]:
     return problems
 
 
-def samples(seed: int, count: int = 200, clean_titles: bool = False):
+def samples(seed: int, count: int = 200, clean_titles: bool = False, duplicates: bool = False):
     rng = random.Random(seed)
-    return [make_reply(rng, clean_titles) for _ in range(count)]
+    return [make_reply(rng, clean_titles, duplicates) for _ in range(count)]
 
 
 def assert_coverage(batch) -> None:
@@ -489,15 +489,15 @@ def test_odd_headings_and_code_blocks_are_read_correctly():
 def test_section_names_become_linkable_and_unique():
     rows = [
         ("## C#\n甲\n## a|b\n乙\n## [重点]\n丙\n## 2^10\n丁", ["## C＃", "## a｜b", "## ［重点］", "## 2＾10"]),
-        ("## 案例\n甲\n## 案例\n乙\n## 案例\n丙", ["## 案例", "## 案例（2）", "## 案例（3）"]),
-        ("## 案例\n甲\n## 案例\n乙\n## 案例（2）\n丙", ["## 案例", "## 案例（3）", "## 案例（2）"]),
-        ("## Prompt\n甲\n## prompt\n乙\n## Ｐｒｏｍｐｔ\n丙", ["## Prompt", "## prompt（2）", "## Ｐｒｏｍｐｔ（3）"]),
+        ("## 案例\n甲\n## 案例\n乙\n## 案例\n丙", ["## 案例"]),
+        ("## 案例\n甲\n## 案例\n乙\n## 案例（2）\n丙", ["## 案例", "## 案例（2）"]),
+        ("## Prompt\n甲\n## prompt\n乙\n## Ｐｒｏｍｐｔ\n丙", ["## Prompt"]),
         ("## 一\n### 案例\n甲\n## 案例\n乙", ["## 一", "## 案例（2）"]),
-        ("##\n甲\n## \n乙", ["## 小节", "## 小节（2）"]),
+        ("##\n甲\n## \n乙", ["## 小节"]),
         ("## ##\n甲\n## 二\n乙", ["## 小节", "## 二"]),
         ("## #\n甲\n## 二\n乙", ["## 小节", "## 二"]),
-        ("## C#\n甲\n## C＃\n乙", ["## C＃", "## C＃（2）"]),
-        ("## 案例 ##\n甲\n## 案例\n乙", ["## 案例 ##", "## 案例（2）"]),
+        ("## C#\n甲\n## C＃\n乙", ["## C＃"]),
+        ("## 案例 ##\n甲\n## 案例\n乙", ["## 案例 ##"]),
         ("## 一\n### C#\n甲\n## 二", ["## 一", "## 二"]),
         ("## 课\n甲\n## 二\n乙", ["## 课（2）", "## 二"]),
         ("## 课（2）\n甲\n## 课\n乙", ["## 课（2）", "## 课（3）"]),
@@ -788,8 +788,9 @@ def test_very_long_replies_finish_quickly():
     started = time.perf_counter()
     result = structure_notes(many, META)
     assert time.perf_counter() - started < 10
-    assert section_lines(result) == ["## 案例"] + [f"## 案例（{n}）" for n in range(2, 2001)]
-    assert len(outline_lines(result)) == 2000
+    assert section_lines(result) == ["## 案例"]
+    assert result.count("索" * 150) == 2000
+    assert len(outline_lines(result)) == 1
 
     odd = "## 前\n甲\n" + "#" * 200000 + "\n" + " " * 200000 + "## x\n" + "*" * 200000 + "\n## 后\n乙"
     started = time.perf_counter()
@@ -1444,8 +1445,9 @@ def test_any_code_block_keeps_a_quote_section(fence):
 def test_two_quote_sections_of_the_same_name():
     kept = finish("## 引述\n> 索引不是万能的\n\n## 一\n甲。\n\n## 引述\n> 联合索引要遵守")
     assert (kept.removed_quotes, kept.removed_concepts) == (0, 0)
-    assert section_lines(kept.markdown) == ["## 引述", "## 一", "## 引述（2）"]
-    assert "- [[#引述（2）]]" in outline_lines(kept.markdown)
+    assert section_lines(kept.markdown) == ["## 引述", "## 一"]
+    assert outline_lines(kept.markdown) == ["- [[#引述]]", "- [[#一]]"]
+    assert "> 索引不是万能的\n\n> 联合索引要遵守" in kept.markdown
     assert redone(kept) == NotesResult(kept.markdown, 0, 0)
     one_gone = finish("## 引述\n> 索引不是万能的\n\n## 一\n甲。\n\n## 引述\n> 编造出来的一句话")
     assert (one_gone.removed_quotes, one_gone.removed_concepts) == (1, 0)
@@ -1512,7 +1514,7 @@ def _headings_match(line: str, title: str, level: int) -> bool:
 
 
 def test_finished_notes_keep_and_drop_what_the_generator_says():
-    batch = quoted_samples(20261221)
+    batch = quoted_samples(20261221, count=400)
     assert_quote_coverage(batch)
     for reply, source, expect in batch:
         case = repr((reply, source))
@@ -2066,3 +2068,66 @@ def test_very_long_rules_and_sources_make_a_prompt_quickly():
         assert prompt == rules + PROMPT_HEAD + body + PROMPT_TAIL
         prompts.append(prompt)
     assert prompts[0] == prompts[1]
+
+
+def test_sections_with_the_same_name_become_one_section_in_order():
+    reply = "## 一\n甲\n\n## 引述\n> 第一句话\n\n## 二\n乙\n\n## 引述\n> 第二句话\n### 小标题\n丙\n\n## 引述\n> 第三句话"
+    result = structure_notes(reply, COURSE)
+    assert section_lines(result) == ["## 一", "## 引述", "## 二"]
+    assert outline_lines(result) == ["- [[#一]]", "- [[#引述]]", "- [[#二]]"]
+    quotes = result.split("## 引述\n")[1].split("\n## ")[0]
+    assert quotes == "> 第一句话\n\n> 第二句话\n### 小标题\n丙\n\n> 第三句话\n"
+    assert result.count("第一句话") == result.count("第二句话") == result.count("第三句话") == 1
+    assert structure_notes(result, COURSE) == result
+
+
+def test_merging_same_name_sections_keeps_other_sections_exactly_as_they_were():
+    reply = "## 核心宗旨\n要点。\n\n## 一\n甲\n\n## 二\n乙"
+    assert structure_notes(reply, COURSE) == (
+        COURSE_HEADER + "\n## 核心宗旨\n要点。\n\n## 本课脉络\n\n- [[#一]]\n- [[#二]]\n\n## 一\n甲\n\n## 二\n乙\n"
+    )
+
+
+def test_an_empty_duplicate_adds_nothing_and_text_before_the_first_section_stays():
+    result = structure_notes("前言\n\n## 引述\n> 一句话\n\n## 引述\n\n## 二\n乙", COURSE)
+    assert section_lines(result) == ["## 引述", "## 二"]
+    assert "前言" in result and result.count("> 一句话") == 1
+
+
+def test_duplicate_quote_sections_are_one_section_when_the_notes_are_finished():
+    result = finish("## 引述\n> 索引不是万能的\n\n## 一\n甲。\n\n## 引述\n> 编造出来的一句话\n\n## 引述\n> 联合索引要遵守")
+    assert (result.removed_quotes, result.removed_concepts) == (1, 0)
+    assert section_lines(result.markdown) == ["## 引述", "## 一"]
+    assert "> 索引不是万能的\n\n> 联合索引要遵守" in result.markdown
+    assert redone(result) == NotesResult(result.markdown, 0, 0)
+
+
+def test_merging_same_name_sections_loses_and_repeats_nothing():
+    batch = samples(20261216, count=300, duplicates=True)
+    merged = 0
+    for reply, expect in batch:
+        if expect.empty or not expect.sections:
+            continue
+        result = structure_notes(reply, META)
+        case = repr(reply)
+        level = expect.sections[0][2]
+        titles = {position for position, _, _ in expect.sections}
+        want = sorted(line for position, line in enumerate(expect.body_lines) if position not in titles)
+        lines = result.split("\n")[5:]
+        outline = [i for i, lvl, text in headings("\n".join(lines)) if text == "本课脉络"]
+        if outline:
+            start = end = outline[0]
+            end += 1
+            if end < len(lines) and lines[end] == "":
+                end += 1
+            while end < len(lines) and lines[end].startswith("- [[#"):
+                end += 1
+            lines = lines[:start] + lines[end:]
+        # Section headings are the only lines that may change; the rest must all be there once.
+        got = sorted(line for line in lines if line.strip() and not (headings(line) and headings(line)[0][1] == level))
+        want = [line for line in want if not (headings(line) and headings(line)[0][1] == level)]
+        assert got == want, case
+        keys = [key(text) for _, lvl, text in headings(result) if lvl == level and text != "本课脉络"]
+        assert len(keys) == len(set(keys)), case
+        merged += len(expect.sections) - len(keys)
+    assert merged >= 100, merged

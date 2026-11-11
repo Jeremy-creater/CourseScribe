@@ -299,7 +299,8 @@ class _Builder:
 
     def area(self, level: int) -> list[Line]:
         rng = self.rng
-        title = rng.choice(_AREA_TITLES)
+        # Two quote sections with one name would be merged into one, so each gets its own.
+        title = rng.choice([t for t in _AREA_TITLES if t not in {used for used, _, _ in self.areas}])
         # Each element: (lines, starts with >), lines as (text, expected).
         elements: list[tuple[list[tuple[str, str | None]], bool]] = []
         count = 0 if rng.random() < 0.1 else rng.randint(1, 6)

@@ -353,6 +353,32 @@ def _section_names(found: list[tuple[int, int, str]], level: int, name: str) -> 
     return names
 
 
+def _merge_same_name(lines: list[str], found: list[tuple[int, int, str]], level: int) -> list[str]:
+    """``lines`` with each later section of the same name joined to the first, in order.
+
+    The body of a later section (its sub-headings too) follows the first one's, after a
+    blank line. Nothing changes when no two sections share a name.
+    """
+    starts = [index for index, _ in _sections(found, level)]
+    spans = [lines[a:b] for a, b in zip(starts, starts[1:] + [len(lines)])]
+    # A code block left open runs to the end of the text, so the last section stays where it is.
+    open_end = _in_code(lines + [""])[-1]
+    first_of: dict[str, int] = {}
+    merged: list[list[str]] = []
+    for index, span in zip(starts, spans):
+        text = _heading(span[0])[1].translate(_LINKABLE) or _EMPTY_SECTION
+        at = first_of.setdefault(_key(text), len(merged))
+        if at == len(merged) or (open_end and span is spans[-1]):
+            merged.append(span)
+            continue
+        body = _trim(span[1:])
+        if body:
+            merged[at] = _trim(merged[at]) + [""] + body + [""]
+    if len(merged) == len(spans):
+        return lines
+    return lines[: starts[0]] + [line for span in merged for line in span]
+
+
 def assemble_notes(body: str, meta: NotesMeta) -> str:
     """The finished notes: the program's header, then ``body`` with an outline of its sections."""
     if content_chars(body) == "":
@@ -363,6 +389,9 @@ def assemble_notes(body: str, meta: NotesMeta) -> str:
     split = len(lines)
     if found:
         level = min(lvl for _, lvl, _ in found)
+        if (joined := _merge_same_name(lines, found, level)) is not lines:
+            lines = _trim(joined)
+            found = _headings(lines)
         names = _section_names(found, level, meta.name)
         sections = list(names)
         core = next((n for n, (_, text) in enumerate(_sections(found, level)) if _is_core(text)), -1)

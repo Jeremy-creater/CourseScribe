@@ -8,6 +8,7 @@ kept lines say anything at all.
 from __future__ import annotations
 
 import random
+import unicodedata
 from dataclasses import dataclass
 from datetime import date
 
@@ -88,7 +89,24 @@ def _content(rng: random.Random, level: int, fences: tuple[str, ...], subtitles:
     return ["---"]
 
 
-def make_reply(rng: random.Random, clean_titles: bool = False) -> tuple[str, Expect]:
+def _name_key(title: str) -> str:
+    """What makes two section names the same name: width, case, and the characters links cannot hold."""
+    text = unicodedata.normalize("NFKC", title.translate(str.maketrans("#|^[]", "＃｜＾［］"))) or "小节"
+    return text.casefold()
+
+
+def _without_same_names(rng: random.Random, titles: list[str]) -> list[str]:
+    """``titles`` with a different pick wherever a name came up twice (same-name sections are merged)."""
+    seen: set[str] = set()
+    for index, title in enumerate(titles):
+        while _name_key(title) in seen:
+            title = rng.choice(SECTION_TITLES)
+        seen.add(_name_key(title))
+        titles[index] = title
+    return titles
+
+
+def make_reply(rng: random.Random, clean_titles: bool = False, duplicates: bool = False) -> tuple[str, Expect]:
     """A model reply and what tidying it must give."""
     roll = rng.random()
     level = 2 if roll < 0.7 else 3 if roll < 0.9 else 1
@@ -117,6 +135,8 @@ def make_reply(rng: random.Random, clean_titles: bool = False) -> tuple[str, Exp
             subtitles = CLEAN_SUBTITLES
         else:
             titles = [rng.choice(SECTION_TITLES) for _ in range(count)]
+            if not duplicates:
+                titles = _without_same_names(rng, titles)
             subtitles = SECTION_TITLES
             while level == 1 and titles[0] == NAME:
                 titles[0] = rng.choice(SECTION_TITLES)
