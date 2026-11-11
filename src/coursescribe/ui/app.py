@@ -133,7 +133,7 @@ def run() -> int:
         notes_rules=rules_path(),
     )
     hotkey = create_global_hotkey(window.hotkey_pressed.emit)
-    if not hotkey.start():
+    if not hotkey.start() and HOTKEY_LABEL:  # a system without a shortcut says nothing about one being taken
         window.hotkey_label.setText("快捷键被别的程序占用了，请用按钮。也可以把文件拖到这里")
     window.show()
     controller.start()
