@@ -152,3 +152,55 @@ def test_with_auto_notes_on_a_real_lesson_goes_on_to_its_notes_one_model_at_a_ti
     assert (lesson_job.txt_path.read_bytes(), md.read_bytes()) == (kept["txt"], kept["md"])
     print(f"\nremoved quotes: {notes_job.removed_quotes}, removed concepts: {notes_job.removed_concepts}, "
           f"took {took:.0f} s")
+
+
+def test_dropping_a_proofread_md_makes_its_notes_on_the_real_model(tmp_path, monkeypatch):
+    """12-8 I1: a .md dropped on the window becomes notes through the program's own assembly."""
+    import json
+    from datetime import date
+
+    from coursescribe.jobs import JobKind
+    from coursescribe.models import DEFAULT_PROOFREAD_MODEL, DEFAULT_TRANSCRIBE_MODEL
+    from coursescribe.notes import NotesMeta, lecture_date
+    from coursescribe.ui.app import build_controller
+    from test_notes import header
+    from test_notes_job import _loaded_models
+    from test_proofread import _ready_notes_model
+
+    client = OllamaClient()
+    _ready_notes_model(client)
+    home = tmp_path / "家"
+    home.mkdir()
+    monkeypatch.setenv("COURSESCRIBE_HOME", str(home))
+    (home / "settings.json").write_text(
+        json.dumps({"format": 2, "output_dir": str(tmp_path / "out"), "transcribe_model": DEFAULT_TRANSCRIBE_MODEL,
+                    "proofread_model": DEFAULT_PROOFREAD_MODEL}),
+        encoding="utf-8",
+    )
+    md = tmp_path / "数据库索引.md"
+    md.write_text(f"# {md.stem}\n\n{LESSON}\n", encoding="utf-8")
+    before = md.read_bytes()
+    controller = build_controller(home, threading.Event())
+    try:
+        controller.start()
+        controller.add_files([md])
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            jobs = controller.store.load_all()
+            if jobs and all(j.stage in (Stage.DONE, Stage.FAILED) for j in jobs) and controller.state.pending == 0:
+                break
+            time.sleep(0.5)
+    finally:
+        controller.shutdown()
+    job = controller.store.load_all()[0]
+    assert job.kind is JobKind.NOTES and job.stage is Stage.DONE, job.message
+    notes = md.with_name(f"{md.stem}-整理笔记.md")
+    made_on = date.fromtimestamp(job.created_ns / 1e9)
+    assert notes.read_text(encoding="utf-8").startswith(header(NotesMeta(md.stem, lecture_date(md.stem, made_on))))
+    assert md.read_bytes() == before
+    assert "笔记已生成" in controller.state.notice
+    deadline = time.time() + 10
+    while _loaded_models() and time.time() < deadline:
+        time.sleep(0.5)
+    assert _loaded_models() == []
+    print("\n", controller.state.notice)
