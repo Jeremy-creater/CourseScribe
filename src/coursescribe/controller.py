@@ -69,6 +69,9 @@ SETTINGS_NOT_SAVED = (
     "下次打开程序时，还是上次保存的设置。"
 )
 NOTES_NOT_AUTO = "这节课的整理笔记没有自动生成，以后可以手动生成整理笔记。"
+NOT_ADDED_TXT = "{name}（这是文字稿，整理笔记要用它的校对稿 .md）"
+NOTES_DRAFT = "笔记是初稿，请自己看一遍。"
+NOT_READABLE = "{name}（读不到这个文件，可能是它所在的硬盘或网络断开了）"
 
 _MAX_ATTEMPTS = 2
 _PAUSED = "这个任务连续两次让程序意外退出，已暂停。可以点“重试”再试一次，或点“忽略”。"
@@ -88,6 +91,23 @@ class AppState:
     model_needed: str | None = None
     downloading: bool = False
     last_folder: Path | None = None
+    last_md: Path | None = None
+
+
+def notes_done_notice(job: Job) -> str:
+    """What the user is told once the notes of ``job`` are written. Reads the job record only."""
+    text = f"笔记已生成：{job.notes_path.name}。"
+    removed = []
+    if job.removed_quotes:
+        removed.append(f"{job.removed_quotes} 条对不上原文的引述")
+    if job.removed_concepts:
+        removed.append(f"{job.removed_concepts} 个原文里没有的概念")
+    if removed:
+        text += "删掉了 " + "、".join(removed) + "。"
+    text += NOTES_DRAFT
+    if job.rules_note:
+        text += "\n" + job.rules_note
+    return text
 
 
 class AppController:
@@ -281,6 +301,8 @@ class AppController:
         changes: dict = self._waiting_counts()  # reads files: before the lock, not between count and publish
         if job.stage is Stage.DONE and notice is None:
             changes["last_folder"] = job.folder
+        if job.stage is Stage.DONE and job.kind is not JobKind.NOTES:
+            changes["last_md"] = job.md_path  # on disk already, even if the last record could not be saved
         source, refused = self._notes_source(notes_for) if notes_for is not None else (None, None)
         notes_job = None
         with self._lock:
@@ -304,7 +326,7 @@ class AppController:
     @staticmethod
     def _usual_notice(job: Job, current: str) -> str:
         if job.stage is Stage.DONE and job.kind is JobKind.NOTES and job.notes_path is not None:
-            return f"笔记已生成：{job.notes_path.name}"
+            return notes_done_notice(job)
         if job.stage is Stage.DONE:
             name = job.folder.name
             return f"完成：{name}。{job.message}" if job.message else f"完成：{name}"
@@ -329,18 +351,45 @@ class AppController:
         self._publish(status=text, fraction=fraction)
 
     def add_files(self, paths: Iterable[Path]) -> None:
-        """Queue media files. Anything else is refused, and the notice says why."""
+        """Queue media files, and make notes for proofread .md files. Anything else is refused.
+
+        All the reasons are put in one notice, published once at the end.
+        """
         refused: list[str] = []
         no_folder: list[str] = []
         too_long: list[str] = []
         no_record: list[str] = []
+        notes_refused: list[str] = []
+        notes_queued = False
         settings = self.settings
         for path in paths:
             path = Path(path)
-            if not path.is_file():
+            suffix = path.suffix.lower()
+            if suffix == ".md":
+                source, why = self._notes_source(path)
+                if source is not None:
+                    with self._lock:
+                        job, why = self._notes_job_for(source)
+                        if job is not None:
+                            extra = {} if notes_queued else {"notice": ""}
+                            self._enqueue(job, **extra, **self._waiting_counts())
+                            notes_queued = True
+                if why is not None:
+                    notes_refused.append(why)
+                continue
+            try:
+                found = path.is_file()
+            except OSError as exc:
+                logger.warning("Could not look at %s: %s", path, exc)
+                refused.append(NOT_READABLE.format(name=path.name))
+                continue
+            if not found:
                 refused.append(f"{path.name}（不是文件）")
                 continue
-            if path.suffix.lower() not in MEDIA_SUFFIXES:
+            if suffix == ".txt":
+                refused.append(NOT_ADDED_TXT.format(name=path.name))
+                continue
+            if suffix not in MEDIA_SUFFIXES:
                 refused.append(f"{path.name}（不支持这种格式）")
                 continue
             try:
@@ -365,6 +414,7 @@ class AppController:
             notices.append("没有加入：" + "、".join(no_record) + "。" + self._data_problem())
         if refused:
             notices.append("没有加入：" + "、".join(refused))
+        notices.extend(notes_refused)
         if notices:
             self._publish(notice="\n".join(notices))
 

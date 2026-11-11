@@ -14,7 +14,7 @@ from PySide6.QtCore import QLockFile, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from coursescribe.controller import MEDIA_SUFFIXES, AppController, KeepAwake
+from coursescribe.controller import AppController, KeepAwake
 from coursescribe.jobs import JobStore
 from coursescribe.notes_rules import load_notes_rules, rules_path
 from coursescribe.notes_writer import OllamaNotesWriter
@@ -29,7 +29,7 @@ from coursescribe.platform import (
 from coursescribe.proofread import OllamaProofreader
 from coursescribe.settings import app_home, open_settings
 from coursescribe.transcribe import WhisperTranscriber, download_whisper_model
-from coursescribe.ui.main_window import MainWindow
+from coursescribe.ui.main_window import FILE_DIALOG_TITLE, FILE_FILTER, MainWindow
 from coursescribe.ui.style import apply_style
 from coursescribe.vocabulary import FILE_NAME as WORD_LIST_FILE
 from coursescribe.vocabulary import load_vocabulary
@@ -70,8 +70,7 @@ def install_error_reporting(notify: Callable[[], None] | None = None) -> None:
 
 
 def _choose_files(parent) -> list[Path]:
-    patterns = " ".join(f"*{suffix}" for suffix in sorted(MEDIA_SUFFIXES))
-    names, _ = QFileDialog.getOpenFileNames(parent, "选择音视频文件", "", f"音视频文件 ({patterns})")
+    names, _ = QFileDialog.getOpenFileNames(parent, FILE_DIALOG_TITLE, "", FILE_FILTER)
     return [Path(name) for name in names]
 
 

@@ -16,12 +16,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from coursescribe.controller import AppController, AppState
+from coursescribe.controller import MEDIA_SUFFIXES, AppController, AppState
 from coursescribe.ui.settings_dialog import SettingsDialog
 from coursescribe.ui.style import set_role
 
 _PROGRESS_STEPS = 1000
 _SILENCE_TEXT = "已经 30 秒没有录到声音。请确认课程正在播放、没有静音。"
+FILE_DIALOG_TITLE = "选择音视频文件或校对稿"
+
+
+def file_filters() -> list[str]:
+    """The kinds of file the "选择文件" window offers; the first one is shown to begin with."""
+    media = " ".join(f"*{suffix}" for suffix in sorted(MEDIA_SUFFIXES))
+    return [f"音视频文件和校对稿 ({media} *.md)", f"音视频文件 ({media})", "校对稿 (*.md)"]
+
+
+FILE_FILTER = ";;".join(file_filters())  # the way Qt takes several
 
 
 def _hidden(widget):
@@ -110,6 +120,10 @@ class MainWindow(QWidget):
         self.download_button.clicked.connect(self._download_model)
         self.open_button = _hidden(QPushButton("打开文件夹"))
         self.open_button.clicked.connect(self._open_last_folder)
+        self.notes_button = _hidden(QPushButton("生成整理笔记"))
+        self.notes_button.clicked.connect(self._make_notes)
+        self.continue_notes_button = _hidden(QPushButton("继续整理笔记"))
+        self.continue_notes_button.clicked.connect(self.controller.continue_notes)
         actions = QHBoxLayout()
         actions.setSpacing(8)
         actions.addWidget(self.retry_button)
@@ -117,6 +131,8 @@ class MainWindow(QWidget):
         actions.addWidget(self.dismiss_failed_button)
         actions.addWidget(self.download_button)
         actions.addWidget(self.open_button)
+        actions.addWidget(self.notes_button)
+        actions.addWidget(self.continue_notes_button)
         actions.addStretch(1)
 
         self.status_card = QFrame()
@@ -176,6 +192,9 @@ class MainWindow(QWidget):
         if needs_download:
             self.download_button.setText(f"下载模型（{self.controller.needed_model_size()}）")
         self.open_button.setVisible(state.last_folder is not None)
+        self.notes_button.setVisible(state.last_md is not None)
+        self.notes_button.setToolTip(f"整理：{state.last_md.name}" if state.last_md is not None else "")
+        self.continue_notes_button.setVisible(state.waiting_notes > 0 and not working)
         self._refresh_recording_time()
 
     def _refresh_recording_time(self) -> None:
@@ -208,6 +227,11 @@ class MainWindow(QWidget):
         )
         if self._confirm(question):
             self.controller.download_needed_model()
+
+    def _make_notes(self) -> None:
+        md = self.controller.state.last_md
+        if md is not None:
+            self.controller.make_notes(md)
 
     def _open_last_folder(self) -> None:
         folder = self.controller.state.last_folder

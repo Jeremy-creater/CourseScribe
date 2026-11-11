@@ -30,9 +30,9 @@ def qt_app():
 
 
 class Screen:
-    def __init__(self, tmp_path, qt_app, notes_rules=None):
+    def __init__(self, tmp_path, qt_app, notes_rules=None, **rig):
         self.qt_app = qt_app
-        self.rig = Rig(tmp_path)
+        self.rig = Rig(tmp_path, **rig)
         self.chosen: list = []
         self.answer_yes = True
         self.asked: list[str] = []
