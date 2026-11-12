@@ -65,9 +65,16 @@ def choose_output_dir(documents: str | Path | None, home: Path, sync_roots: Iter
     if target is None or sync_roots is None:
         return fallback
     target += (APP_NAME.casefold(),)
+    targets = [target]
+    try:  # Documents may only be a link into a synced folder (iCloud's Desktop & Documents)
+        real = _parts(os.path.realpath(documents))
+    except (OSError, ValueError):
+        real = None
+    if real is not None:
+        targets.append(real + (APP_NAME.casefold(),))
     for root in sync_roots:
         folder = _parts(root)
-        if folder is not None and _within(target, folder):
+        if folder is not None and any(_within(t, folder) for t in targets):
             return fallback
     return Path(documents) / APP_NAME
 

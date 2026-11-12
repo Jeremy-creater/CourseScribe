@@ -550,3 +550,29 @@ def test_mac_sync_folder_is_icloud_drive_under_home(tmp_path, monkeypatch):
     roots = macos.cloud_sync_roots()
     assert roots == [str(tmp_path / "Library" / "Mobile Documents" / "com~apple~CloudDocs")]
     assert list(tmp_path.iterdir()) == []
+
+
+def test_documents_that_is_a_link_into_a_synced_folder_moves_to_home(tmp_path):
+    """With iCloud's Desktop & Documents on, the Documents path may only point into iCloud Drive."""
+    home = tmp_path / "Users" / "a"
+    cloud = home / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
+    (cloud / "Documents").mkdir(parents=True)
+    documents = home / "Documents"
+    try:
+        documents.symlink_to(cloud / "Documents", target_is_directory=True)
+    except OSError as exc:  # Windows without the symlink privilege: the real-Mac case is still checked there
+        pytest.fail(f"Cannot create a test link here: {exc}")
+    _same(choose_output_dir(documents, home, [str(cloud)]), home / "CourseScribe")
+
+
+def test_a_link_to_an_unsynced_folder_keeps_documents(tmp_path):
+    home = tmp_path / "Users" / "a"
+    elsewhere = tmp_path / "Disk" / "Docs"
+    elsewhere.mkdir(parents=True)
+    (home).mkdir(parents=True)
+    documents = home / "Documents"
+    try:
+        documents.symlink_to(elsewhere, target_is_directory=True)
+    except OSError as exc:
+        pytest.fail(f"Cannot create a test link here: {exc}")
+    _same(choose_output_dir(documents, home, [str(home / "Library" / "Mobile Documents" / "com~apple~CloudDocs")]), documents / "CourseScribe")
