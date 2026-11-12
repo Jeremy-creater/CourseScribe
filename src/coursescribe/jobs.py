@@ -93,6 +93,8 @@ def _byte_budget(root: Path) -> int | None:
     if LIMITS.path_bytes is not None:
         budgets.append((LIMITS.path_bytes - _bytes(str(root)) - 2 - _NOTES_TAIL_BYTES) // 2)  # root/name/name+tail
     return min(budgets) if budgets else None
+
+
 _NOTES_NAME = re.compile(re.escape(NOTES_SUFFIX) + r"( \(\d+\))?\.md$", re.IGNORECASE)
 
 
