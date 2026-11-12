@@ -40,7 +40,7 @@ def test_the_platforms_report_their_own_limits():
 
 
 def test_a_long_chinese_name_is_cut_so_the_longest_notes_file_fits_in_255_bytes(mac):
-    root = Path("/Users/a/Documents/CourseScribe")
+    root = Path("/Volumes/Example/CourseScribe")
     raw = "讲" * 100
     name = job_name(raw, root)
     assert name == "讲" * 78  # 78 * 3 + the 21 bytes of "-整理笔记 (99).md" = 255
@@ -49,14 +49,14 @@ def test_a_long_chinese_name_is_cut_so_the_longest_notes_file_fits_in_255_bytes(
 
 
 def test_names_that_already_fit_are_left_alone_on_the_mac(mac):
-    root = Path("/Users/a/Documents/CourseScribe")
+    root = Path("/Volumes/Example/CourseScribe")
     assert job_name("索引" * 30, root) == "索引" * 30  # 60 characters, 180 bytes
     assert job_name("x" * 200, root) == "x" * 80  # the 80-character rule still holds
     assert job_name("😀" * 100, root) == "😀" * 40  # 80 UTF-16 units: 40 emoji, 160 bytes
 
 
 def test_a_mac_name_is_never_cut_inside_a_character(mac):
-    root = Path("/Users/a/Documents/CourseScribe")
+    root = Path("/Volumes/Example/CourseScribe")
     family = "👨‍👩‍👧"  # one symbol, 18 bytes
     assert job_name("讲" * 76 + family + "尾", root) == "讲" * 76  # 6 bytes are left: no half symbol
     assert job_name("讲" * 77 + "é" * 10, root) == "讲" * 77 + "é"  # 3 bytes left: one whole "é"
@@ -68,7 +68,7 @@ def test_a_mixed_name_on_the_mac_always_leaves_room_for_every_file_it_makes(mac)
     cut = 0
     for _ in range(400):
         raw = "".join(rng.choice(pieces) for _ in range(rng.randrange(1, 150)))
-        root = Path("/Users/" + "u" * rng.randrange(1, 300))
+        root = Path("/Volumes/" + "u" * rng.randrange(1, 300))
         name = job_name(raw, root)
         for tail in (LONGEST_TAIL, ".txt", ".md", ".wav", " (99)"):
             assert _bytes(name + tail) <= 255, (raw, name)
