@@ -9,6 +9,7 @@ from pathlib import Path
 
 from coursescribe.platform.file_identity import mac_file_identity_key as file_identity_key
 from coursescribe.platform.limits import MAC_LIMITS
+from coursescribe.platform.mac_hotkey import HOTKEY_LABEL, create_global_hotkey  # noqa: F401
 
 
 def open_system_audio():
@@ -20,22 +21,8 @@ def open_system_audio():
 def prepare_gpu_libraries() -> None:
     """Nothing to prepare: the Mac build runs the engine on the CPU."""
 
-
-HOTKEY_LABEL = ""
 FILES_CAN_BE_HELD = False  # an open file never shuts others out; a refusal is real
 LIMITS = MAC_LIMITS
-
-
-class _NoHotkey:
-    def start(self) -> bool:
-        return False
-
-    def stop(self) -> None:
-        pass
-
-
-def create_global_hotkey(callback) -> _NoHotkey:
-    return _NoHotkey()
 
 
 def caffeinate_command(pid: int) -> list[str]:
