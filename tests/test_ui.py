@@ -65,7 +65,21 @@ class Screen:
         raise AssertionError(f"Timed out; state: {self.rig.controller.state}")
 
     def idle(self):
-        self.wait(lambda: self.rig.controller.state.pending == 0 and self.window.status_label.text() == "准备好了")
+        """Wait until the work is over AND the window has drawn the final state. The controller finishes on a
+        worker thread and the window hears of it through queued signals, so on a fast machine the window may
+        still show its first "准备好了" while the controller is already done; the buttons that follow the final
+        state (open folder, notes) are the proof that the window caught up."""
+
+        def window_caught_up() -> bool:
+            state, window = self.rig.controller.state, self.window
+            return (
+                state.pending == 0
+                and window.status_label.text() == "准备好了"
+                and window.open_button.isHidden() == (state.last_folder is None)
+                and window.notes_button.isHidden() == (state.last_md is None)
+            )
+
+        self.wait(window_caught_up)
 
     def close(self):
         """Destroy the window here: Qt aborts if garbage collection does it on a worker thread."""
