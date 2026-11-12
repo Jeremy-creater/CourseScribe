@@ -7,6 +7,8 @@ test_jobs.py, test_denied_folder.py and test_notes_job.py.
 from __future__ import annotations
 
 import random
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -32,11 +34,56 @@ def mac(monkeypatch):
     monkeypatch.setattr(jobs, "LIMITS", MAC)
 
 
-def test_the_platforms_report_their_own_limits():
-    from coursescribe.platform import macos, windows
+def test_the_mac_and_windows_limits_have_their_own_numbers_on_any_system():
+    from coursescribe.platform.limits import MAC_LIMITS, WINDOWS_LIMITS
+
+    assert MAC_LIMITS == MAC
+    assert WINDOWS_LIMITS == WINDOWS
+
+
+def test_each_limit_sets_only_the_fields_that_apply_to_its_system():
+    from coursescribe.platform.limits import MAC_LIMITS, WINDOWS_LIMITS
+
+    assert WINDOWS_LIMITS.path_units is not None
+    assert WINDOWS_LIMITS.component_bytes is None and WINDOWS_LIMITS.path_bytes is None
+    assert MAC_LIMITS.path_units is None
+    assert MAC_LIMITS.component_bytes is not None and MAC_LIMITS.path_bytes is not None
+
+
+def test_the_running_system_reports_its_own_limits():
+    from coursescribe import platform
+
+    assert platform.LIMITS == (WINDOWS if sys.platform == "win32" else MAC)
+
+
+def test_the_mac_module_reports_the_mac_limits():
+    from coursescribe.platform import macos
 
     assert macos.LIMITS == MAC
-    assert windows.LIMITS == WINDOWS
+
+
+if sys.platform != "win32":  # on Windows the Windows module is imported on purpose
+
+    def test_importing_the_platform_package_off_windows_never_loads_the_windows_module():
+        code = (
+            "import sys; import coursescribe.platform; "
+            "print('winreg' in sys.modules, 'coursescribe.platform.windows' in sys.modules)"
+        )
+        out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, check=True)
+        assert out.stdout.split() == ["False", "False"]
+
+
+if sys.platform == "win32":
+
+    class TestWindowsOnly:
+        """Needs the real Windows module (and winreg)."""
+
+        def test_the_windows_module_reports_the_windows_limits(self):
+            from coursescribe.platform import windows
+            from coursescribe.platform.limits import WINDOWS_LIMITS
+
+            assert windows.LIMITS == WINDOWS
+            assert windows.LIMITS is WINDOWS_LIMITS
 
 
 def test_a_long_chinese_name_is_cut_so_the_longest_notes_file_fits_in_255_bytes(mac):

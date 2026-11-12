@@ -15,12 +15,11 @@ from pathlib import Path
 import numpy as np
 
 from coursescribe.platform.file_identity import windows_file_identity_key as file_identity_key
-from coursescribe.platform.limits import PathLimits
+from coursescribe.platform.limits import WINDOWS_LIMITS
 
 # A program holding a file open can shut everyone else out for a moment (antivirus, indexer).
 FILES_CAN_BE_HELD = True
-# Windows counts the whole path, in UTF-16 units (MAX_PATH less the terminating null).
-LIMITS = PathLimits(path_units=259, component_bytes=None, path_bytes=None)
+LIMITS = WINDOWS_LIMITS
 
 logger = logging.getLogger(__name__)
 
