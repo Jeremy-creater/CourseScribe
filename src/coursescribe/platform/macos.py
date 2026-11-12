@@ -1,4 +1,4 @@
-"""Mac implementations. System audio capture arrives in the Mac phase of the plan."""
+"""Mac implementations."""
 
 from __future__ import annotations
 
@@ -12,7 +12,9 @@ from coursescribe.platform.limits import MAC_LIMITS
 
 
 def open_system_audio():
-    raise NotImplementedError("System audio capture on the Mac is not built yet")
+    from coursescribe.platform.mac_audio import MacSystemAudio
+
+    return MacSystemAudio()
 
 
 def prepare_gpu_libraries() -> None:
