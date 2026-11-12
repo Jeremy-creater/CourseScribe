@@ -311,7 +311,7 @@ def test_save_folder_too_long_creates_nothing(tmp_path, kind):
 @pytest.mark.parametrize("letter", ["讲", "😀"])
 def test_every_accepted_save_folder_leaves_room_for_the_longest_path(letter):
     for length in range(3, 204):
-        root = Path("C:/" + "r" * (length - 3))
+        root = _root(length, Path(Path.cwd().anchor))  # a root valid on this platform
         assert _u16(str(root)) == length
         name = job_name(letter * 100, root)
         assert length + 2 * _u16(name) + 16 <= 259, length
