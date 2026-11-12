@@ -147,7 +147,10 @@ def _reference(batch) -> tuple[list[tuple[JobKind, str]], list[str]]:
             elif _NOTES_NAME.search(path.name):
                 not_noted.append(NOTES_IS_NOTES.format(name=path.name))
             else:
-                key = os.path.normcase(os.path.realpath(path))
+                # Reason for the edit (WI-2): the file is the same file when the disk says so (the path exists
+                # here, checked above). The old string rule (normcase) does nothing on a Mac volume that ignores case.
+                found = os.stat(path)
+                key = (found.st_dev, found.st_ino)
                 if key in noted:
                     not_noted.append(NOTES_ALREADY.format(name=noted[key]))
                 else:

@@ -17,6 +17,7 @@ from coursescribe.jobs import Job, JobKind, JobStore, SaveFolderTooLong, Stage, 
 from coursescribe.models import model_size_label
 from coursescribe.notes_writer import OllamaNotesWriter
 from coursescribe.pipeline import Pipeline, Proofreader, Transcriber
+from coursescribe.platform import file_identity_key
 from coursescribe.recorder import AudioCapture, RecordingFailed, RecordingSession
 from coursescribe.settings import Settings, SettingsStore
 from coursescribe.wavfile import repair_wav
@@ -29,9 +30,9 @@ MEDIA_SUFFIXES = frozenset(
 )
 
 
-def _same_file(path: Path) -> str:
-    """One spelling for every way of naming the same file; a file no longer there compares by its path."""
-    return os.path.normcase(os.path.realpath(path))
+def _same_file(path: Path):
+    """One key for every way of naming the same file; the system decides what that means (see platform)."""
+    return file_identity_key(path)
 
 
 def _remove_if_empty(folder: Path) -> None:

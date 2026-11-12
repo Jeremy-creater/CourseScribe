@@ -14,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
+from coursescribe.platform.file_identity import windows_file_identity_key as file_identity_key
 from coursescribe.platform.limits import PathLimits
 
 # A program holding a file open can shut everyone else out for a moment (antivirus, indexer).

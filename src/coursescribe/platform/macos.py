@@ -7,6 +7,7 @@ import subprocess
 import threading
 from pathlib import Path
 
+from coursescribe.platform.file_identity import mac_file_identity_key as file_identity_key
 from coursescribe.platform.limits import PathLimits
 
 

@@ -229,6 +229,10 @@ class DiskFault:
 
 
 def same_file(a: Path, b: Path) -> bool:
+    # Reason for the edit (WI-2): files that exist are the same file when the disk says so (a Mac volume may
+    # ignore case although ``normcase`` does nothing there); the string rule stays for files that are gone.
+    if a.exists() and b.exists():
+        return os.path.samefile(a, b)
     return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
 
 
@@ -244,14 +248,17 @@ def notes_files(md: Path) -> list[str]:
     return [name for name in names(md.parent) if name.startswith(f"{md.stem}{NOTES_SUFFIX}")]
 
 
-def case_blind() -> bool:
-    return os.path.normcase("A") == "a"
+def upper_is_same_file(md: Path) -> bool:
+    """Does the disk this file is on treat the upper-case spelling as the same file? Asked of the disk, not
+    of Python's string rule: a Mac volume ignores case although ``os.path.normcase`` does nothing there."""
+    upper = Path(str(md).upper())
+    return upper.exists() and os.path.samefile(upper, md)
 
 
 def spellings(md: Path) -> list[Path]:
     """Ways a user or the system may name the same file."""
     ways = [md, md.parent / ".." / md.parent.name / md.name]
-    if case_blind():
+    if upper_is_same_file(md):
         ways.append(Path(str(md).upper()))
     return ways
 
@@ -1189,7 +1196,7 @@ def test_making_notes_again_while_they_are_being_made_does_nothing_but_say_so(tm
         assert len(notes_jobs(rig.store)) == 1 and len(svc.gens) == 1
     upper = Path(str(md).upper())
     rig.controller.make_notes(upper)
-    if case_blind():
+    if upper_is_same_file(md):
         assert rig.controller.state.notice == NOTES_ALREADY.format(name=md.name)
     else:
         assert rig.controller.state.notice == NOTES_NOT_A_FILE.format(name=upper.name)
@@ -2312,3 +2319,96 @@ def test_a_really_read_only_folder(tmp_path, svc):
         assert took < 2
     Flow(store, svc.writer()).run(retry(job))
     assert job.stage is Stage.DONE and len(svc.gens) == 1
+
+
+# ---------------------------------------------------------------- WI-2: which requests count as "the same file"
+
+
+def test_a_different_file_is_not_blocked_by_a_running_one(tmp_path, svc, rigs):
+    gate = gated(svc)
+    md = lesson(tmp_path)
+    same_name_elsewhere = lesson(tmp_path, folder_name="另一个文件夹")
+    other = lesson(tmp_path, name="另一课")
+    rig = rigs()
+    rig.controller.start()
+    rig.controller.make_notes(md)
+    rig.wait(lambda: len(svc.gens) == 1)
+    for path in (other, same_name_elsewhere):
+        rig.controller.make_notes(path)
+        assert rig.controller.state.notice == "", path
+    assert len(notes_jobs(rig.store)) == 3
+    gate.set()
+    rig.wait_idle()
+    assert [job.stage for job in notes_jobs(rig.store)] == [Stage.DONE] * 3
+
+
+def test_each_running_file_refuses_its_own_other_spellings_and_nothing_else(tmp_path, svc, rigs):
+    gate = gated(svc)
+    a = lesson(tmp_path, name="a")
+    b = lesson(tmp_path, name="b")
+    rig = rigs()
+    rig.controller.start()
+    rig.controller.make_notes(a)
+    rig.controller.make_notes(b)
+    rig.wait(lambda: len(svc.gens) == 1)
+    pending = rig.controller.state.pending
+    asks = [(Path(str(b).upper()), "b.md" if upper_is_same_file(b) else None), (a.parent / ".." / a.parent.name / a.name, "a.md"), (a, "a.md"), (b, "b.md")]
+    for path, name in asks:
+        rig.controller.make_notes(path)
+        if name is None:  # a case-sensitive disk: B.MD is not a file at all
+            assert rig.controller.state.notice == NOTES_NOT_A_FILE.format(name=path.name)
+        else:
+            assert rig.controller.state.notice == NOTES_ALREADY.format(name=name), path
+        assert rig.controller.state.pending == pending
+        assert len(notes_jobs(rig.store)) == 2
+    gate.set()
+    rig.wait_idle()
+    assert len(svc.gens) == 2
+    assert notes_files(a) == ["a-整理笔记.md"] and notes_files(b) == ["b-整理笔记.md"]
+
+
+def test_a_gone_file_is_not_a_file_whatever_it_was_spelled_like(tmp_path, svc, rigs):
+    gate = gated(svc)
+    md = lesson(tmp_path)
+    rig = rigs()
+    rig.controller.start()
+    rig.controller.make_notes(md)
+    rig.wait(lambda: len(svc.gens) == 1)
+    before = notes_jobs(rig.store)
+    md.unlink()
+    for path in (Path(str(md).upper()), md, md.parent / "nope.md"):
+        rig.controller.make_notes(path)
+        assert rig.controller.state.notice == NOTES_NOT_A_FILE.format(name=path.name), path
+    assert notes_jobs(rig.store) == before
+    gate.set()
+    rig.wait_idle()
+
+
+def test_a_failed_job_frees_the_file_under_any_spelling(tmp_path, svc, rigs):
+    svc.serve(CUT, CUT)
+    md = lesson(tmp_path)
+    rig = rigs()
+    rig.controller.start()
+    rig.controller.make_notes(md)
+    rig.wait_idle()
+    assert [job.stage for job in notes_jobs(rig.store)] == [Stage.FAILED]
+    svc.serve()
+    for spelling in spellings(md):
+        rig.controller.make_notes(spelling)
+        rig.wait_idle()
+        assert rig.controller.state.notice.startswith("笔记已生成"), spelling
+    assert [job.stage for job in notes_jobs(rig.store)][0] is Stage.DONE
+
+
+def test_the_old_job_of_a_file_made_again_under_another_case_is_found(tmp_path, svc, rigs):
+    md = lesson(tmp_path)
+    rig = rigs()
+    rig.controller.start()
+    rig.controller.make_notes(md)
+    rig.wait_idle()
+    for spelling in spellings(md):
+        since = len(rig.states)
+        rig.controller.make_notes(spelling)
+        assert saw_pending_one(rig, since)  # a finished file may be made again, under any spelling
+        rig.wait_idle()
+    assert [job.stage for job in notes_jobs(rig.store)] == [Stage.DONE] * (1 + len(spellings(md)))

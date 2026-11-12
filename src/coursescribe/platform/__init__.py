@@ -9,6 +9,7 @@ if sys.platform == "win32":
         FILES_CAN_BE_HELD,
         LIMITS,
         cloud_sync_roots,
+        file_identity_key,
         HOTKEY_LABEL,
         create_global_hotkey,
         create_keep_awake,
@@ -20,6 +21,7 @@ else:
         FILES_CAN_BE_HELD,
         LIMITS,
         cloud_sync_roots,
+        file_identity_key,
         HOTKEY_LABEL,
         create_global_hotkey,
         create_keep_awake,
@@ -34,6 +36,7 @@ __all__ = [
     "cloud_sync_roots",
     "create_global_hotkey",
     "create_keep_awake",
+    "file_identity_key",
     "open_system_audio",
     "prepare_gpu_libraries",
 ]
