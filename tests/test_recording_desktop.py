@@ -322,3 +322,62 @@ def test_g3_a_device_chosen_by_id_is_never_followed_away():
             assert capture.device_name == speaker.name
         assert [block.shape for block in blocks] == [(12000, 2)] * 4
     assert _default_outputs("--show") == before
+
+
+# The manager on the real Windows system (matrix case 17; written on a Mac and not yet run on Windows).
+
+
+def _windows_manager():
+    from coursescribe.hotkey_manager import HotkeyManager
+    from coursescribe.platform import create_global_hotkey, hotkey_label
+
+    return HotkeyManager(create_global_hotkey, lambda: None, "windows", hotkey_label)
+
+
+def _windows_probe_is_refused(shortcut) -> bool:
+    from coursescribe.platform import create_global_hotkey
+
+    probe = create_global_hotkey(shortcut, lambda: None)
+    try:
+        return probe.start() is False
+    finally:
+        probe.stop()
+
+
+def test_the_manager_switches_and_keeps_the_old_combination_when_the_new_one_is_held():
+    from coursescribe.hotkey_manager import Outcome
+    from coursescribe.platform import create_global_hotkey
+    from coursescribe.shortcut import parse
+
+    default, other, third = (parse(t, "windows") for t in ("ctrl+alt+r", "ctrl+alt+shift+t", "ctrl+alt+shift+y"))
+    manager = _windows_manager()
+    holder = create_global_hotkey(third, lambda: None)
+    try:
+        assert manager.apply(default).outcome is Outcome.APPLIED
+        assert manager.apply(other).outcome is Outcome.APPLIED
+        assert _windows_probe_is_refused(other) is True
+        assert _windows_probe_is_refused(default) is False
+        assert holder.start() is True
+        assert manager.apply(third).outcome is Outcome.KEPT_OLD
+        assert manager.live == other and _windows_probe_is_refused(other) is True
+    finally:
+        manager.shutdown()
+        holder.stop()
+    assert _windows_probe_is_refused(other) is False
+
+
+def test_applying_the_current_combination_keeps_the_same_registration_on_windows():
+    from coursescribe.hotkey_manager import Outcome
+    from coursescribe.shortcut import parse
+
+    default = parse("ctrl+alt+r", "windows")
+    manager = _windows_manager()
+    try:
+        assert manager.apply(default).outcome is Outcome.APPLIED
+        handle = manager._handle
+        assert manager.apply(default).message == ""
+        assert manager._handle is handle
+        assert _windows_probe_is_refused(default) is True
+    finally:
+        manager.shutdown()
+    assert _windows_probe_is_refused(default) is False

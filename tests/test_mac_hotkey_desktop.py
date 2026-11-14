@@ -142,3 +142,58 @@ def test_a_refused_registration_leaves_the_first_one_and_the_system_intact():
 def test_the_label_follows_the_shortcut_on_the_real_system():
     assert macos.hotkey_label(DEFAULT) == "⌃⌥R"
     assert macos.hotkey_label(OTHER) == "⌃⌥⇧T"
+
+
+# ---- the manager on the real system (matrix cases 15-16; nothing is pressed) ----------------------
+
+
+def _real_manager():
+    from coursescribe.hotkey_manager import HotkeyManager
+
+    return HotkeyManager(macos.create_global_hotkey, lambda: None, "mac", macos.hotkey_label)
+
+
+def _probe_is_refused(shortcut) -> bool:
+    """Try to take the combination with a fresh registration: refused means something already holds it."""
+    probe = macos.create_global_hotkey(shortcut, lambda: None)
+    try:
+        return probe.start() is False
+    finally:
+        probe.stop()
+
+
+def test_the_manager_switches_to_a_free_combination_and_keeps_the_old_when_the_new_is_held():
+    from coursescribe.hotkey_manager import Outcome
+
+    third = parse("ctrl+alt+shift+y", "mac")
+    manager = _real_manager()
+    holder = macos.create_global_hotkey(third, lambda: None)
+    try:
+        assert manager.apply(DEFAULT).outcome is Outcome.APPLIED
+        assert manager.apply(OTHER).outcome is Outcome.APPLIED
+        assert _probe_is_refused(OTHER) is True  # the new one is really held
+        assert _probe_is_refused(DEFAULT) is False  # and the old one really released
+        assert holder.start() is True
+        result = manager.apply(third)
+        assert result.outcome is Outcome.KEPT_OLD
+        assert manager.live == OTHER and _probe_is_refused(OTHER) is True
+    finally:
+        manager.shutdown()
+        holder.stop()
+    assert _probe_is_refused(OTHER) is False  # nothing left registered
+
+
+def test_applying_the_current_combination_on_the_real_system_keeps_the_same_registration():
+    from coursescribe.hotkey_manager import Outcome
+
+    manager = _real_manager()
+    try:
+        assert manager.apply(DEFAULT).outcome is Outcome.APPLIED
+        handle = manager._handle
+        result = manager.apply(DEFAULT)
+        assert result.outcome is Outcome.APPLIED and result.message == ""
+        assert manager._handle is handle
+        assert _probe_is_refused(DEFAULT) is True
+    finally:
+        manager.shutdown()
+    assert _probe_is_refused(DEFAULT) is False

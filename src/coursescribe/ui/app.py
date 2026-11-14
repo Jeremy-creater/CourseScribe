@@ -15,13 +15,13 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from coursescribe.controller import AppController, KeepAwake
+from coursescribe.hotkey_manager import HotkeyManager
 from coursescribe.jobs import JobStore
 from coursescribe.notes_rules import load_notes_rules, rules_path
 from coursescribe.notes_writer import OllamaNotesWriter
 from coursescribe.ollama import OllamaClient, OllamaError
 from coursescribe.platform import (
     DEFAULT_HOTKEY,
-    HOTKEY_LABEL,
     HOTKEY_PLATFORM,
     create_global_hotkey,
     create_keep_awake,
@@ -131,6 +131,13 @@ def run() -> int:
     except InvalidShortcut:  # a damaged setting never reaches here, but the default is always safe
         shortcut = parse(DEFAULT_HOTKEY, HOTKEY_PLATFORM)
 
+    manager = HotkeyManager(
+        create_global_hotkey,
+        lambda: window.hotkey_pressed.emit(),
+        HOTKEY_PLATFORM,
+        hotkey_label,
+        on_change=lambda label, note: window.set_hotkey_hint(label, note),
+    )
     window = MainWindow(
         controller,
         hotkey_label=hotkey_label(shortcut),
@@ -140,13 +147,14 @@ def run() -> int:
         list_proofread_models=_list_proofread_models,
         word_list=home / WORD_LIST_FILE,
         notes_rules=rules_path(),
+        # Saving runs on the window's own thread; a Mac must register shortcuts on the main thread,
+        # so the manager is only ever called from here (主线程), never from a worker.
+        on_settings_saved=lambda settings: manager.apply_text(settings.hotkey),
     )
-    hotkey = create_global_hotkey(shortcut, window.hotkey_pressed.emit)
-    if not hotkey.start() and HOTKEY_LABEL:  # a system without a shortcut says nothing about one being taken
-        window.hotkey_label.setText("快捷键被别的程序占用了，请用按钮。也可以把文件拖到这里")
+    manager.apply(shortcut)  # on failure the manager shows the "taken" text itself
     window.show()
     controller.start()
     try:
         return app.exec()
     finally:
-        hotkey.stop()
+        manager.shutdown()

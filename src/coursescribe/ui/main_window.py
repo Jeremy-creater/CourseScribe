@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from coursescribe.controller import MEDIA_SUFFIXES, AppController, AppState
+from coursescribe.settings import Settings
 from coursescribe.ui.settings_dialog import SettingsDialog
 from coursescribe.ui.style import set_role
 
@@ -44,6 +45,12 @@ def _muted(label: QLabel) -> QLabel:
     return label
 
 
+def _hotkey_hint(label: str, note: str) -> str:
+    if note:
+        return f"{note}。也可以把文件拖到这里"
+    return f"快捷键 {label}，也可以把文件拖到这里" if label else "可以把文件拖到这里"
+
+
 class MainWindow(QWidget):
     hotkey_pressed = Signal()
     _state_changed = Signal(object)
@@ -58,9 +65,11 @@ class MainWindow(QWidget):
         list_proofread_models: Callable[[], Iterable[str]],
         word_list: Path | None = None,
         notes_rules: Path | None = None,
+        on_settings_saved: Callable[[Settings], None] | None = None,
     ) -> None:
         super().__init__()
         self.controller = controller
+        self._on_settings_saved = on_settings_saved
         self._choose_files = choose_files
         self._confirm = confirm
         self._open_folder = open_folder
@@ -92,9 +101,7 @@ class MainWindow(QWidget):
         buttons.addWidget(self.files_button, 2)
         buttons.addWidget(self.settings_button, 1)
 
-        self.hotkey_label = _muted(
-            QLabel(f"快捷键 {hotkey_label}，也可以把文件拖到这里" if hotkey_label else "可以把文件拖到这里")
-        )
+        self.hotkey_label = _muted(QLabel(_hotkey_hint(hotkey_label, "")))
         self.hotkey_label.setAlignment(Qt.AlignCenter)
         self.recording_label = _hidden(QLabel())
         self.recording_label.setObjectName("recording")
@@ -216,8 +223,15 @@ class MainWindow(QWidget):
             notes_rules=self._notes_rules,
         )
         if dialog.exec():
-            self.controller.update_settings(dialog.result_settings())
+            saved = dialog.result_settings()
+            self.controller.update_settings(saved)
+            if self._on_settings_saved is not None:
+                self._on_settings_saved(saved)  # the caller decides what a saved setting changes
         dialog.deleteLater()  # destroyed here, never by garbage collection on a worker thread
+
+    def set_hotkey_hint(self, label: str, note: str = "") -> None:
+        """Show the shortcut hint under the buttons; only displays what it is given."""
+        self.hotkey_label.setText(_hotkey_hint(label, note))
 
     def _download_model(self) -> None:
         state = self.controller.state
