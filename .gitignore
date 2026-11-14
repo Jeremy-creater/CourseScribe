@@ -26,3 +26,6 @@ coverage*.json
 
 # private sample lessons kept next to the code for local evaluation
 /Temp/
+
+# icon drafts (the chosen one lives in packaging/icons)
+/icon/
