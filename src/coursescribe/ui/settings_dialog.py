@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
+from PySide6.QtCore import QEvent, Signal
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -14,19 +16,53 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QWidget,
 )
 
 from coursescribe.models import DEFAULT_NOTES_MODEL, MODELS, model_size_label
+from coursescribe.platform import DEFAULT_HOTKEY, HOTKEY_PLATFORM
 from coursescribe.notes_rules import NotesRulesUnreadable, ensure_notes_rules
 from coursescribe.settings import Settings
+from coursescribe.shortcut import InvalidShortcut, Shortcut, parse
+from coursescribe.ui.key_capture import candidate_text, is_leaving_press
 from coursescribe.ui.style import set_role
 from coursescribe.vocabulary import WORD_LIST_CREATE_FAILED, WORD_LIST_UNREADABLE, ensure_word_list
 
 WORD_NOTE = "写常用词，或“听错 → 正确”，校对时自动替换"
 AUTO_NOTES_TEXT = "转录完自动生成整理笔记"
 RULES_NOTE = "整理笔记时交给模型的规则，改完保存，下次整理时生效"
+
+
+class KeyRecorder(QLineEdit):
+    """Read-only box that turns a key press into candidate shortcut text; it decides nothing itself."""
+
+    captured = Signal(str)
+
+    def __init__(self, platform: str) -> None:
+        super().__init__()
+        self._platform = platform
+        self.setReadOnly(True)
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.ShortcutOverride:
+            event.accept()  # Ctrl+letter is for recording here, not for the window's own shortcuts
+            return True
+        return super().event(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.isAutoRepeat():
+            event.accept()  # holding a key down must not flash the reason
+            return
+        key, modifiers = event.key(), event.modifiers()
+        if is_leaving_press(key, modifiers):
+            event.ignore()  # Tab moves on, Esc cancels the dialog, Enter is the dialog's own
+            return
+        text = candidate_text(key, modifiers, self._platform)
+        event.accept()
+        if text is not None:  # a modifier alone: keep waiting
+            self.captured.emit(text)
 
 
 class SettingsDialog(QDialog):
@@ -39,6 +75,8 @@ class SettingsDialog(QDialog):
         word_list: Path | None = None,
         open_file: Callable[[Path], None] | None = None,
         notes_rules: Path | None = None,
+        hotkey_platform: str = HOTKEY_PLATFORM,
+        default_hotkey: str = DEFAULT_HOTKEY,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置")
@@ -99,6 +137,21 @@ class SettingsDialog(QDialog):
         rules_row.addWidget(self.rules_note, 1)
         rules_row.addWidget(self.rules_button)
 
+        self._platform = hotkey_platform
+        self._default_shortcut = parse(default_hotkey, hotkey_platform)
+        self._shortcut = self._stored_shortcut(current.hotkey)
+        self.hotkey_box = KeyRecorder(hotkey_platform)
+        self.hotkey_box.captured.connect(self._on_captured)
+        self.hotkey_reset_button = QPushButton("恢复默认")
+        self.hotkey_reset_button.clicked.connect(self._reset_hotkey)
+        self.hotkey_reason = QLabel()
+        self.hotkey_reason.setWordWrap(True)
+        self.hotkey_reason.setProperty("muted", True)
+        hotkey_row = QHBoxLayout()
+        hotkey_row.addWidget(self.hotkey_box, 1)
+        hotkey_row.addWidget(self.hotkey_reset_button)
+        self._show_shortcut()
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("保存")
         set_role(buttons.button(QDialogButtonBox.Ok), "primary")
@@ -106,7 +159,7 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
-        note = QLabel("修改后，从下一个任务开始生效。")
+        note = QLabel("修改后，从下一个任务开始生效。\n快捷键保存后立即生效。")
         note.setProperty("muted", True)
 
         form = QFormLayout(self)
@@ -121,8 +174,33 @@ class SettingsDialog(QDialog):
         form.addRow("保存到", folder_row)
         form.addRow("词表", word_row)
         form.addRow("整理规则", rules_row)
+        form.addRow("录音快捷键", hotkey_row)
+        form.addRow("", self.hotkey_reason)
         form.addRow(note)
         form.addRow(buttons)
+
+    def _stored_shortcut(self, text: str) -> Shortcut:
+        try:
+            return parse(text, self._platform)
+        except InvalidShortcut:
+            return self._default_shortcut  # a value that cannot be used here is never shown or returned
+
+    def _show_shortcut(self) -> None:
+        self.hotkey_box.setText(self._shortcut.display(self._platform))
+
+    def _on_captured(self, text: str) -> None:
+        try:
+            self._shortcut = parse(text, self._platform)
+        except InvalidShortcut as exc:
+            self.hotkey_reason.setText(exc.reason)  # the stored value stays
+            return
+        self.hotkey_reason.setText("")
+        self._show_shortcut()
+
+    def _reset_hotkey(self) -> None:
+        self._shortcut = self._default_shortcut
+        self.hotkey_reason.setText("")
+        self._show_shortcut()
 
     def _show_size(self, name: str) -> None:
         self.size_label.setText(f"没下载过的模型，用到时会先询问（{model_size_label(name)}）")
@@ -169,4 +247,5 @@ class SettingsDialog(QDialog):
             self.proofread_box.currentText().strip(),
             self.notes_box.currentText().strip() or DEFAULT_NOTES_MODEL,  # emptied: back to the default
             self.auto_notes_box.isChecked(),
+            self._shortcut.serialize(),
         )
