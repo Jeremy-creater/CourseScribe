@@ -14,7 +14,7 @@ from __future__ import annotations
 import enum
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from coursescribe.shortcut import InvalidShortcut, Shortcut, parse
 
@@ -65,6 +65,17 @@ class HotkeyManager:
         except InvalidShortcut as exc:
             return ApplyResult(Outcome.KEPT_OLD, self.label, exc.reason)
         return self.apply(shortcut)
+
+    def apply_saved(self, settings, keep: Callable[[object], None]) -> ApplyResult:
+        """Apply the saved shortcut; when it was refused and the old one stays live, `keep` the live one instead.
+
+        Otherwise the settings window and the next start would show a combination that is not the one working.
+        When nothing could be registered the user's choice stays saved, so a later start can try it again.
+        """
+        result = self.apply_text(settings.hotkey)
+        if result.outcome is Outcome.KEPT_OLD and self.live is not None:
+            keep(replace(settings, hotkey=self.live.serialize()))
+        return result
 
     def apply(self, shortcut: Shortcut) -> ApplyResult:
         if self._closed:

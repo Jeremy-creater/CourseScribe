@@ -149,7 +149,7 @@ def run() -> int:
         notes_rules=rules_path(),
         # Saving runs on the window's own thread; a Mac must register shortcuts on the main thread,
         # so the manager is only ever called from here (主线程), never from a worker.
-        on_settings_saved=lambda settings: manager.apply_text(settings.hotkey),
+        on_settings_saved=lambda settings: manager.apply_saved(settings, controller.update_settings),
     )
     manager.apply(shortcut)  # on failure the manager shows the "taken" text itself
     window.show()

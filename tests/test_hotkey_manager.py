@@ -402,7 +402,7 @@ def make_window(tmp_path, qt_app, system, **window_kwargs):
         confirm=lambda question: True,
         open_folder=lambda folder: None,
         list_proofread_models=lambda: ["model-a"],
-        on_settings_saved=lambda settings: manager.apply_text(settings.hotkey),
+        on_settings_saved=lambda settings: manager.apply_saved(settings, rig.controller.update_settings),
     )
     holder["window"] = window
     manager.apply_text(rig.controller.settings.hotkey)
@@ -495,6 +495,31 @@ def test_saving_a_taken_combination_keeps_the_old_one_and_names_the_new_one(tmp_
         assert system.held == {R}
         text = window.hotkey_label.text()
         assert label_of(T) in text and "被别的程序或系统占用" in text and label_of(R) in text and DRAG in text
+    finally:
+        close(rig, window, qt_app, manager)
+
+
+def test_a_taken_combination_is_not_left_in_the_settings_file(tmp_path, qt_app, monkeypatch):
+    system = FakeSystem(); system.taken_elsewhere = {T}
+    rig, window, manager = make_window(tmp_path, qt_app, system)
+    try:
+        monkeypatch.setattr(main_window, "SettingsDialog", save_with(lambda d: press_text(d, "ctrl+alt+t")))
+        window.settings_button.click()
+        assert settings_file(rig)["hotkey"] == "ctrl+alt+r"  # what is live is what is saved and shown next time
+        assert rig.controller.settings.hotkey == "ctrl+alt+r"
+    finally:
+        close(rig, window, qt_app, manager)
+
+
+def test_when_nothing_can_be_registered_the_chosen_combination_stays_saved(tmp_path, qt_app, monkeypatch):
+    system = FakeSystem()
+    rig, window, manager = make_window(tmp_path, qt_app, system)
+    try:
+        system.taken_elsewhere = {T, R}  # the old one can no longer be re-registered either
+        monkeypatch.setattr(main_window, "SettingsDialog", save_with(lambda d: press_text(d, "ctrl+alt+t")))
+        window.settings_button.click()
+        assert manager.live is None
+        assert settings_file(rig)["hotkey"] == "ctrl+alt+t"
     finally:
         close(rig, window, qt_app, manager)
 
