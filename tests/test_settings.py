@@ -576,3 +576,211 @@ def test_a_link_to_an_unsynced_folder_keeps_documents(tmp_path):
     except OSError as exc:
         pytest.fail(f"Cannot create a test link here: {exc}")
     _same(choose_output_dir(documents, home, [str(home / "Library" / "Mobile Documents" / "com~apple~CloudDocs")]), documents / "CourseScribe")
+
+
+# ---- the recording shortcut (hotkey) ---------------------------------------------------
+
+from coursescribe.platform import DEFAULT_HOTKEY, HOTKEY_PLATFORM  # noqa: E402
+from coursescribe.shortcut import KEYS, MODIFIER_ORDER, InvalidShortcut, Shortcut, check, parse  # noqa: E402
+
+_DEFAULT_KEY = "ctrl+alt+r"
+
+
+def _hotkey_defaults(tmp_path) -> Settings:
+    return Settings(tmp_path / "CourseScribe", "large-v3", "m")
+
+
+def _hotkey_store(path: Path, tmp_path, platform: str = "windows", default: str = _DEFAULT_KEY) -> SettingsStore:
+    return SettingsStore(path, _hotkey_defaults(tmp_path), hotkey_platform=platform, default_hotkey=default)
+
+
+def _chosen(tmp_path, hotkey: str) -> Settings:
+    """Settings where every field differs from the default, so a wrongly reset field shows."""
+    return Settings(tmp_path / "D盘" / "课", "small", "m2", "model-x", True, hotkey)
+
+
+def _all_valid(platform: str) -> list[str]:
+    found = []
+    for size in range(len(MODIFIER_ORDER) + 1):
+        for mods in itertools.combinations(MODIFIER_ORDER, size):
+            for key in sorted(KEYS):
+                shortcut = Shortcut(frozenset(mods), key)
+                if check(shortcut, platform) is None:
+                    found.append(shortcut.serialize())
+    return found
+
+
+def test_the_default_hotkey_is_a_valid_shortcut_text_on_this_system(tmp_path, system):
+    assert DEFAULT_HOTKEY == _DEFAULT_KEY
+    assert parse(DEFAULT_HOTKEY, HOTKEY_PLATFORM).serialize() == DEFAULT_HOTKEY
+    assert default_settings().hotkey == DEFAULT_HOTKEY
+    assert Settings(tmp_path, "a", "b").hotkey == DEFAULT_HOTKEY
+    system.roots = []
+    assert open_settings(tmp_path / "none.json").load().hotkey == DEFAULT_HOTKEY
+
+
+def test_a_hotkey_survives_a_real_file_and_is_written_as_text(tmp_path):
+    """S1."""
+    path = tmp_path / "settings.json"
+    settings = _chosen(tmp_path, "ctrl+shift+r")
+    _hotkey_store(path, tmp_path).save(settings)
+    assert json.loads(path.read_text(encoding="utf-8"))["hotkey"] == "ctrl+shift+r"
+    assert _hotkey_store(path, tmp_path).load() == settings
+
+
+@pytest.mark.parametrize("platform", ["windows", "mac"])
+def test_every_valid_hotkey_survives_saving_loading_and_saving_again(tmp_path, platform):
+    """S5: the round trip, and the same bytes on a second save, with no temp file left."""
+    valid = _all_valid(platform)
+    assert len(valid) > 100
+    path = tmp_path / "settings.json"
+    for text in valid:
+        settings = _chosen(tmp_path, text)
+        store = _hotkey_store(path, tmp_path, platform)
+        store.save(settings)
+        first = path.read_bytes()
+        loaded = store.load()
+        assert loaded == settings, text
+        store.save(loaded)
+        assert path.read_bytes() == first, text
+    assert [p.name for p in tmp_path.iterdir()] == ["settings.json"]
+
+
+_BAD_HOTKEYS = [
+    (None, "windows"), (5, "windows"), (True, "windows"), ([], "windows"), (["ctrl", "r"], "windows"),
+    ("", "windows"), ("   ", "windows"), ("banana", "windows"), ("ctrl+space", "windows"),
+    ("shift+r", "windows"), ("win+r", "windows"), ("cmd+r", "windows"), ("ctrl+alt", "windows"),
+    ("ctrl+r+t", "windows"), ("ctrl++r", "windows"), ("ctrl+alt+r" * 100, "windows"),
+    ("shift+r", "mac"), ("win+r", "mac"),
+]
+
+
+def _file_with(tmp_path, name: str, **changes) -> tuple[Path, bytes]:
+    path = tmp_path / name
+    data = {**_base_file(tmp_path), "hotkey": "ctrl+shift+f5", **changes}
+    return path, _write(path, data)
+
+
+@pytest.mark.parametrize("value, platform", _BAD_HOTKEYS)
+def test_a_damaged_hotkey_falls_back_alone_with_one_warning(tmp_path, caplog, value, platform):
+    """S3: only the hotkey goes back to the default; folder, models and the switch stay."""
+    path, before = _file_with(tmp_path, "bad.json", hotkey=value)
+    with caplog.at_level(logging.WARNING, logger="coursescribe.settings"):
+        loaded = _hotkey_store(path, tmp_path, platform).load()
+    assert loaded == _chosen(tmp_path, _DEFAULT_KEY)
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1
+    assert "hotkey" in warnings[0].getMessage()
+    assert path.read_bytes() == before
+
+
+def test_a_fallback_is_the_default_given_to_the_store_not_a_fixed_one(tmp_path):
+    path, _ = _file_with(tmp_path, "bad.json", hotkey="banana")
+    assert _hotkey_store(path, tmp_path, "mac", "shift+cmd+4").load().hotkey == "shift+cmd+4"
+    path, _ = _file_with(tmp_path, "mac-key.json", hotkey="cmd+r")
+    assert _hotkey_store(path, tmp_path, "mac", "shift+cmd+4").load().hotkey == "cmd+r"
+    assert _hotkey_store(path, tmp_path, "windows").load().hotkey == _DEFAULT_KEY
+
+
+def test_a_random_value_in_hotkey_changes_only_the_hotkey_and_never_raises(tmp_path, caplog):
+    """S5: valid text is kept in canonical form, anything else becomes the default."""
+    rng = random.Random(20261114)
+    atoms = ["ctrl", "alt", "shift", "cmd", "win", "r", "5", "f5", "f13", "space", "", " ", "Ctrl", "R", "é", "+"]
+    values: list = [None, 1, 0, 2.5, True, False, [], {}, ["ctrl", "r"], {"a": 1}, "", " "]
+    for round_ in range(300):
+        if rng.random() < 0.4:
+            value = rng.choice(values)
+        else:
+            value = rng.choice(["+", "", " + "]).join(rng.choice(atoms) for _ in range(rng.randint(1, 4)))
+        platform = rng.choice(["windows", "mac"])
+        path, _ = _file_with(tmp_path, f"r-{round_}.json", hotkey=value)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="coursescribe.settings"):
+            loaded = _hotkey_store(path, tmp_path, platform).load()
+        try:
+            expected_key, expect_warning = parse(value, platform).serialize(), False
+        except InvalidShortcut:
+            expected_key, expect_warning = _DEFAULT_KEY, True
+        assert loaded == _chosen(tmp_path, expected_key), (round_, value, platform)
+        assert len(_warnings(caplog)) == (1 if expect_warning else 0), (round_, value, platform)
+
+
+def test_a_file_without_a_hotkey_takes_the_default_silently(tmp_path, caplog):
+    """S1."""
+    path = tmp_path / "old.json"
+    data = _base_file(tmp_path)
+    assert "hotkey" not in data
+    before = _write(path, data)
+    with caplog.at_level(logging.WARNING, logger="coursescribe.settings"):
+        loaded = _hotkey_store(path, tmp_path, "mac", "shift+cmd+4").load()
+    assert loaded == _chosen(tmp_path, "shift+cmd+4")
+    assert caplog.records == []
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("written", ["Ctrl+Alt+R", " ctrl + alt + r ", "ALT+CTRL+R", "\tCtrl+ALT+r\n"])
+def test_a_shortcut_in_odd_case_or_spacing_is_read_in_canonical_form_and_saved_that_way(tmp_path, caplog, written):
+    """S2: the policy is to normalise, not to fall back; the next save writes the canonical text."""
+    path, before = _file_with(tmp_path, "odd.json", hotkey=written)
+    store = _hotkey_store(path, tmp_path)
+    with caplog.at_level(logging.WARNING, logger="coursescribe.settings"):
+        loaded = store.load()
+    assert loaded == _chosen(tmp_path, "ctrl+alt+r")
+    assert caplog.records == []
+    assert path.read_bytes() == before
+    store.save(loaded)
+    assert json.loads(path.read_text(encoding="utf-8"))["hotkey"] == "ctrl+alt+r"
+    assert store.load() == loaded
+
+
+def test_a_valid_non_default_hotkey_is_reset_with_the_rest_when_the_folder_is_damaged(tmp_path, caplog):
+    """S3 (2-B): the existing reset is whole, so the hotkey goes back to the default with the folder."""
+    defaults = _hotkey_defaults(tmp_path)
+    for number, change in enumerate([{"output_dir": 5}, {"output_dir": "relative/dir"}, {"output_dir": ""}]):
+        path, before = _file_with(tmp_path, f"folder-{number}.json", **change)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="coursescribe.settings"):
+            loaded = _hotkey_store(path, tmp_path).load()
+        assert loaded == defaults, change
+        assert loaded.hotkey == _DEFAULT_KEY
+        assert len(_warnings(caplog)) == 1, change
+        assert path.read_bytes() == before
+
+
+def test_a_damaged_hotkey_notes_model_and_switch_each_fall_back_alone_with_one_warning_each(tmp_path, caplog):
+    """S3 (2-A)."""
+    bad = {"hotkey": "banana", "auto_notes": "yes", "notes_model": ""}
+    path, before = _file_with(tmp_path, "all-bad.json", **bad)
+    with caplog.at_level(logging.WARNING, logger="coursescribe.settings"):
+        loaded = _hotkey_store(path, tmp_path).load()
+    assert loaded == Settings(tmp_path / "D盘" / "课", "small", "m2", DEFAULT_NOTES_MODEL, False, _DEFAULT_KEY)
+    warnings = _warnings(caplog)
+    assert len(warnings) == 3
+    for key in bad:
+        assert sum(key in record.getMessage() for record in warnings) == 1, key
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("content", [None, "{not json", "[1, 2]", "[]", "5"])
+def test_a_missing_or_damaged_file_gives_the_defaults_including_the_default_hotkey(tmp_path, content):
+    """S3."""
+    path = tmp_path / "settings.json"
+    if content is not None:
+        path.write_text(content, encoding="utf-8")
+    defaults = _hotkey_defaults(tmp_path)
+    loaded = _hotkey_store(path, tmp_path).load()
+    assert loaded == defaults
+    assert loaded.hotkey == _DEFAULT_KEY
+
+
+def test_settings_never_asks_the_system_which_shortcut_rules_apply(tmp_path, monkeypatch):
+    """S3: only the names given to the store decide; the real system name is not consulted."""
+    for platform, default, other in [("windows", "ctrl+alt+r", "cmd+r"), ("mac", "shift+cmd+4", "win+r")]:
+        for fake_system in ["win32", "darwin", "linux"]:
+            monkeypatch.setattr("sys.platform", fake_system)
+            path, _ = _file_with(tmp_path, f"{platform}-{fake_system}.json", hotkey=other)
+            assert _hotkey_store(path, tmp_path, platform, default).load().hotkey == default
+            path, _ = _file_with(tmp_path, f"{platform}-{fake_system}-ok.json", hotkey="ctrl+f5")
+            assert _hotkey_store(path, tmp_path, platform, default).load().hotkey == "ctrl+f5"
+    source = (Path(settings_module.__file__)).read_text(encoding="utf-8")
+    assert "sys.platform" not in source

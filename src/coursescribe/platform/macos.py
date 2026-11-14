@@ -11,6 +11,9 @@ from coursescribe.platform.file_identity import mac_file_identity_key as file_id
 from coursescribe.platform.limits import MAC_LIMITS
 from coursescribe.platform.mac_hotkey import HOTKEY_LABEL, create_global_hotkey  # noqa: F401
 
+HOTKEY_PLATFORM = "mac"  # the name the shortcut rules use for this system
+DEFAULT_HOTKEY = "ctrl+alt+r"  # canonical shortcut text
+
 
 def open_system_audio():
     from coursescribe.platform.mac_audio import MacSystemAudio

@@ -10,7 +10,9 @@ if sys.platform == "win32":
         LIMITS,
         cloud_sync_roots,
         file_identity_key,
+        DEFAULT_HOTKEY,
         HOTKEY_LABEL,
+        HOTKEY_PLATFORM,
         create_global_hotkey,
         create_keep_awake,
         open_system_audio,
@@ -22,7 +24,9 @@ else:
         LIMITS,
         cloud_sync_roots,
         file_identity_key,
+        DEFAULT_HOTKEY,
         HOTKEY_LABEL,
+        HOTKEY_PLATFORM,
         create_global_hotkey,
         create_keep_awake,
         open_system_audio,
@@ -30,6 +34,8 @@ else:
     )
 
 __all__ = [
+    "DEFAULT_HOTKEY",
+    "HOTKEY_PLATFORM",
     "FILES_CAN_BE_HELD",
     "LIMITS",
     "HOTKEY_LABEL",

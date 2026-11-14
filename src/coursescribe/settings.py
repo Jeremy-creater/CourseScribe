@@ -13,7 +13,8 @@ from platformdirs import user_data_dir, user_documents_dir
 
 from coursescribe.files import atomic_write_json, read_json
 from coursescribe.models import DEFAULT_NOTES_MODEL, DEFAULT_PROOFREAD_MODEL, DEFAULT_TRANSCRIBE_MODEL
-from coursescribe.platform import cloud_sync_roots
+from coursescribe.platform import DEFAULT_HOTKEY, HOTKEY_PLATFORM, cloud_sync_roots
+from coursescribe.shortcut import InvalidShortcut, parse
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class Settings:
     proofread_model: str
     notes_model: str = DEFAULT_NOTES_MODEL
     auto_notes: bool = False  # organised notes made by themselves once a proofread .md is written
+    hotkey: str = DEFAULT_HOTKEY  # canonical shortcut text, see coursescribe.shortcut
 
 
 def _parts(path: str | Path | None) -> tuple[str, ...] | None:
@@ -112,9 +114,19 @@ def open_settings(path: Path) -> SettingsStore:
 
 
 class SettingsStore:
-    def __init__(self, path: Path, defaults: Settings, old_default_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        defaults: Settings,
+        old_default_dir: Path | None = None,
+        hotkey_platform: str = HOTKEY_PLATFORM,
+        default_hotkey: str = DEFAULT_HOTKEY,
+    ) -> None:
         self.path = path
         self.defaults = defaults
+        # Which shortcut rules apply, and what a missing or damaged shortcut becomes.
+        self.hotkey_platform = hotkey_platform
+        self.default_hotkey = default_hotkey
         # Older versions always saved the folder, so their default looks like a choice.
         self.old_default_dir = old_default_dir
 
@@ -130,7 +142,9 @@ class SettingsStore:
             return self.defaults
         # Added later, one by one: a file without them is an older version's, and one gone wrong
         # costs only itself, not the folder and models the user chose.
-        return Settings(folder, transcribe, proofread, self._notes_model(raw), self._auto_notes(raw))
+        return Settings(
+            folder, transcribe, proofread, self._notes_model(raw), self._auto_notes(raw), self._hotkey(raw)
+        )
 
     def _notes_model(self, raw: dict) -> str:
         if "notes_model" not in raw:
@@ -149,6 +163,17 @@ class SettingsStore:
             return value
         logger.warning("Using the default auto_notes: the saved one is %r", value)
         return self.defaults.auto_notes
+
+    def _hotkey(self, raw: dict) -> str:
+        """The saved shortcut in canonical form; a damaged one costs only itself."""
+        if "hotkey" not in raw:
+            return self.default_hotkey
+        value = raw["hotkey"]
+        try:
+            return parse(value, self.hotkey_platform).serialize()
+        except InvalidShortcut as exc:
+            logger.warning("Using the default hotkey: the saved one is %r (%s)", value, exc.reason)
+            return self.default_hotkey
 
     def _folder(self, raw: dict) -> Path:
         if "output_dir" not in raw:
@@ -174,6 +199,7 @@ class SettingsStore:
             # new keys need no new format: older versions read only the keys they know
             "notes_model": settings.notes_model,
             "auto_notes": settings.auto_notes,
+            "hotkey": settings.hotkey,
         }
         if not _same_folder(settings.output_dir, self.defaults.output_dir):
             data["output_dir"] = str(settings.output_dir)

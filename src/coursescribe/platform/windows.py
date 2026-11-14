@@ -130,6 +130,8 @@ def prepare_gpu_libraries() -> None:
 
 
 HOTKEY_LABEL = "Ctrl+Alt+R"
+HOTKEY_PLATFORM = "windows"  # the name the shortcut rules use for this system
+DEFAULT_HOTKEY = "ctrl+alt+r"  # canonical shortcut text
 _MOD_ALT = 0x0001
 _MOD_CONTROL = 0x0002
 _MOD_NOREPEAT = 0x4000
