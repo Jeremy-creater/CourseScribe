@@ -15,6 +15,11 @@ HOTKEY_PLATFORM = "mac"  # the name the shortcut rules use for this system
 DEFAULT_HOTKEY = "ctrl+alt+r"  # canonical shortcut text
 
 
+def hotkey_label(shortcut) -> str:
+    """How the shortcut is written for the user on this system."""
+    return shortcut.display(HOTKEY_PLATFORM)
+
+
 def open_system_audio():
     from coursescribe.platform.mac_audio import MacSystemAudio
 

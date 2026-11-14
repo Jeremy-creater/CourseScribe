@@ -212,9 +212,10 @@ def _press_hotkey() -> None:
 
 def test_global_hotkey_fires_while_another_program_has_focus():
     from coursescribe.platform import create_global_hotkey
+    from coursescribe.shortcut import parse
 
     pressed = threading.Event()
-    hotkey = create_global_hotkey(pressed.set)
+    hotkey = create_global_hotkey(parse("ctrl+alt+r", "windows"), pressed.set)
     assert hotkey.start(), "Ctrl+Alt+R is taken by another program"
     try:
         _press_hotkey()
@@ -225,14 +226,34 @@ def test_global_hotkey_fires_while_another_program_has_focus():
 
 def test_second_registration_reports_the_shortcut_is_taken():
     from coursescribe.platform import create_global_hotkey
+    from coursescribe.shortcut import parse
 
-    first = create_global_hotkey(lambda: None)
+    default = parse("ctrl+alt+r", "windows")
+    first = create_global_hotkey(default, lambda: None)
     assert first.start()
     try:
-        second = create_global_hotkey(lambda: None)
+        second = create_global_hotkey(default, lambda: None)
         assert second.start() is False
     finally:
         first.stop()
+
+
+def test_a_non_default_shortcut_registers_is_refused_twice_and_frees_up_after_stop():
+    from coursescribe.platform import create_global_hotkey
+    from coursescribe.shortcut import parse
+
+    other = parse("ctrl+alt+shift+t", "windows")
+    first = create_global_hotkey(other, lambda: None)
+    second = create_global_hotkey(other, lambda: None)
+    third = create_global_hotkey(other, lambda: None)
+    try:
+        assert first.start()
+        assert second.start() is False
+        first.stop()
+        assert third.start()  # each start uses a new object: GlobalHotkey.start() works once
+    finally:
+        for hotkey in (first, second, third):
+            hotkey.stop()
 
 
 # Following the default output device (plan M2, item 14).

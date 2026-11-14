@@ -16,6 +16,7 @@ import numpy as np
 
 from coursescribe.platform.file_identity import windows_file_identity_key as file_identity_key
 from coursescribe.platform.limits import WINDOWS_LIMITS
+from coursescribe.platform.win_hotkey import GlobalHotkey, create_global_hotkey  # noqa: F401
 
 # A program holding a file open can shut everyone else out for a moment (antivirus, indexer).
 FILES_CAN_BE_HELD = True
@@ -132,53 +133,11 @@ def prepare_gpu_libraries() -> None:
 HOTKEY_LABEL = "Ctrl+Alt+R"
 HOTKEY_PLATFORM = "windows"  # the name the shortcut rules use for this system
 DEFAULT_HOTKEY = "ctrl+alt+r"  # canonical shortcut text
-_MOD_ALT = 0x0001
-_MOD_CONTROL = 0x0002
-_MOD_NOREPEAT = 0x4000
-_VK_R = 0x52
-_WM_HOTKEY = 0x0312
-_WM_QUIT = 0x0012
-_HOTKEY_ID = 1
 
 
-class GlobalHotkey:
-    """Calls back when the shortcut is pressed, whichever program has the focus."""
-
-    def __init__(self, callback: Callable[[], None]) -> None:
-        self._callback = callback
-        self._thread = threading.Thread(target=self._listen, name="hotkey", daemon=True)
-        self._ready = threading.Event()
-        self._registered = False
-        self._thread_id = 0
-
-    def start(self) -> bool:
-        """Returns False when another program already owns this shortcut."""
-        self._thread.start()
-        self._ready.wait(5)
-        return self._registered
-
-    def _listen(self) -> None:
-        user32 = ctypes.windll.user32
-        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
-        modifiers = _MOD_CONTROL | _MOD_ALT | _MOD_NOREPEAT
-        self._registered = bool(user32.RegisterHotKey(None, _HOTKEY_ID, modifiers, _VK_R))
-        self._ready.set()
-        if not self._registered:
-            return
-        message = wintypes.MSG()
-        while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
-            if message.message == _WM_HOTKEY:
-                self._callback()
-        user32.UnregisterHotKey(None, _HOTKEY_ID)
-
-    def stop(self) -> None:
-        if self._registered and self._thread.is_alive():
-            ctypes.windll.user32.PostThreadMessageW(self._thread_id, _WM_QUIT, 0, 0)
-            self._thread.join(2.0)
-
-
-def create_global_hotkey(callback: Callable[[], None]) -> GlobalHotkey:
-    return GlobalHotkey(callback)
+def hotkey_label(shortcut) -> str:
+    """How the shortcut is written for the user on this system."""
+    return shortcut.display(HOTKEY_PLATFORM)
 
 
 _POWER_REQUEST_SYSTEM_REQUIRED = 1
