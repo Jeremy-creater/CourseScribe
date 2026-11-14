@@ -52,12 +52,14 @@ exe = EXE(
     exclude_binaries=True,
     name="CourseScribe",
     console=False,
+    icon=str(ROOT / "packaging" / "icons" / "CourseScribe.ico"),
 )
 coll = COLLECT(exe, analysis.binaries, analysis.datas, name="CourseScribe")
 if sys.platform == "darwin":
     app = BUNDLE(
         coll,
         name="CourseScribe.app",
+        icon=str(ROOT / "packaging" / "icons" / "CourseScribe.icns"),
         bundle_identifier="app.coursescribe.CourseScribe",
         info_plist={
             "CFBundleName": "CourseScribe",
