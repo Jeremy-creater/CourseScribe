@@ -244,8 +244,19 @@ class MainWindow(QWidget):
 
     def _make_notes(self) -> None:
         md = self.controller.state.last_md
-        if md is not None:
+        if md is None:
+            return
+        try:
+            there = md.is_file()
+        except OSError:
+            there = False
+        if there:
             self.controller.make_notes(md)
+            return
+        # Renamed or moved after the user checked it: let them point at the file now.
+        chosen = list(self._choose_files())
+        if chosen:
+            self.controller.add_files(chosen)
 
     def _open_last_folder(self) -> None:
         folder = self.controller.state.last_folder

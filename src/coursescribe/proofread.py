@@ -48,6 +48,7 @@ _FILLERS = frozenset("嗯呃啊呢哦额唉哎呀嘛哈")
 _TIC_WORDS = ("对不对", "对吧", "对啊", "是吧", "yeah", "这个", "那个", "然后")
 _MAX_LOST_RUN = 2  # characters: a longer gap is lost or invented text
 _MAX_STUTTER = 6  # a doubled run longer than this is a repeated passage, not a stutter
+_RESTATE_WIDTHS = (2, 3, 4)  # a phrase said twice, the second time with one character misheard
 _MAX_SPELLING_FIX = 4  # letters an English respelling may drop or add
 _MAX_REPLACED = 6
 _MAX_TERM_LENGTH = 12
@@ -115,6 +116,8 @@ def is_lossless(original: str, corrected: str) -> bool:
                 return False
         elif not new and len(old) <= _MAX_STUTTER and old * 2 in before:
             continue  # a stutter: the same words said twice in a row, kept once
+        elif not new and _is_restated(old, before):
+            continue  # "闭环了闭闺了": said again with a misheard character, kept once
         elif (old + new).isascii() and len(old + new) <= _MAX_SPELLING_FIX:
             changed += 1  # part of a misheard English word respelled, "client" -> "CLI"
         else:
@@ -123,6 +126,23 @@ def is_lossless(original: str, corrected: str) -> bool:
                 return False
             changed += len(real)
     return changed <= limit
+
+
+def _is_restated(removed: str, text: str) -> bool:
+    """Whether ``removed`` lies inside a phrase that ``text`` says twice in a row, one character apart."""
+    if not removed:
+        return False
+    at = text.find(removed)
+    while at != -1:
+        for width in _RESTATE_WIDTHS:
+            if len(removed) > 2 * width:
+                continue
+            for start in range(max(0, at + len(removed) - 2 * width), min(at, len(text) - 2 * width) + 1):
+                first, second = text[start : start + width], text[start + width : start + 2 * width]
+                if sum(x != y for x, y in zip(first, second)) <= 1:
+                    return True
+        at = text.find(removed, at + 1)
+    return False
 
 
 def _without_tics(run: str) -> str:

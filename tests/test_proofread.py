@@ -164,6 +164,8 @@ class TestCleanCopyEdits:
             ("然后他就像你的研究生一样派发出一堆的subagent", "然后它就像你的研究生一样，派发出一堆的 subagent。"),
             ("yeah然后我们继续讲", "然后我们继续讲。"),
             ("你要用client你不要用这个GUI", "你要用CLI，你不要用这个GUI。"),  # a misheard English term
+            # a phrase said twice with one word misheard the second time: kept once
+            ("手机上我想要的东西了闭环了 闭闺了让它自己开发自己", "手机上我想要的东西了闭环了，让它自己开发自己。"),
         ],
     )
     def test_accepts_dropped_tics_stutters_and_pronoun_fixes(self, original, corrected):
@@ -179,6 +181,10 @@ class TestCleanCopyEdits:
     def test_still_rejects_lost_or_changed_meaning(self, corrected):
         original = "所以今天我们用AI去辅助学习然而有一件事情没有变就是信息获取了之后消化的能力没有变"
         assert not is_lossless(original, corrected)
+
+    def test_still_rejects_a_lost_phrase_that_is_not_a_repeat(self):
+        original = "手机上我想要的东西闭环了所以说让它自己开发自己"
+        assert not is_lossless(original, "手机上我想要的东西闭环了，让它自己开发自己。")
 
 
 class TestParseBreaks:

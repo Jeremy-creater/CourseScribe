@@ -113,6 +113,24 @@ def test_the_notes_button_makes_notes_of_the_lesson_just_finished(notes_screen):
     assert sorted(p.name for p in md.parent.iterdir()) == sorted([f"{NAME}.txt", f"{NAME}.md", NOTES_FILE])
 
 
+def test_the_notes_button_asks_for_the_file_when_the_proofread_md_was_renamed(notes_screen):
+    """The user checks and renames the .md after the lesson: the button must not say "not found"."""
+    screen, window = notes_screen, notes_screen.window
+    md = finish_lesson(screen)
+    renamed = md.with_name("核对过的课.md")
+    md.rename(renamed)
+    screen.chosen = [renamed]
+
+    window.notes_button.click()
+    screen.wait(lambda: notice(screen).startswith("笔记已生成："))
+    screen.idle()
+
+    assert NOTES_NOT_A_FILE.format(name=md.name) not in notice(screen)
+    jobs = notes_jobs(screen.rig.store)
+    assert len(jobs) == 1 and jobs[0].source_md == renamed and jobs[0].stage is Stage.DONE
+    assert (renamed.parent / "核对过的课-整理笔记.md").exists()
+
+
 # ---------------------------------------------------------------- W2 (the two clicks and the button following last_md)
 
 
@@ -482,8 +500,8 @@ def test_a_problem_when_the_button_is_clicked_is_said_and_the_button_stays(notes
     md = finish_lesson(screen)
     moved = md.with_name("挪走.md")
     md.rename(moved)
+    screen.chosen = []  # the file window opens and the user closes it
     window.notes_button.click()
-    assert notice(screen) == NOTES_NOT_A_FILE.format(name=md.name)
     assert notes_jobs(rig.store) == [] and window.notes_button.isVisible()
     moved.rename(md)
     _job_records_fail(rig, lambda job: job.kind is JobKind.NOTES)
