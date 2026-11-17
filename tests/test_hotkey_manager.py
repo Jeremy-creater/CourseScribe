@@ -43,7 +43,7 @@ R, T, Y, U = sc("ctrl+alt+r"), sc("ctrl+alt+t"), sc("ctrl+alt+y"), sc("ctrl+alt+
 
 
 def label_of(shortcut) -> str:
-    return shortcut.display("mac")
+    return shortcut.display(HOTKEY_PLATFORM)
 
 
 # ------------------------------------------------------------------------------------- the fake system

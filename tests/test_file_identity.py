@@ -113,7 +113,10 @@ def test_a_missing_file_compares_by_spelling(tmp_path):
 def test_nfc_and_nfd_spellings_share_a_key_for_missing_and_real_files(tmp_path, left, right):
     assert key(tmp_path / left) == key(tmp_path / right)  # both missing
     made = make(tmp_path / "real" / left)
-    assert key(made) == key(tmp_path / "real" / right)  # one real, asked for under the other spelling
+    if (tmp_path / "real" / right).exists():  # this disk (APFS) treats the two spellings as one name
+        assert key(made) == key(tmp_path / "real" / right)  # one real, asked for under the other spelling
+    else:  # this disk (NTFS) keeps them as two different files, so they must not share a key
+        assert key(made) != key(make(tmp_path / "real" / right))
 
 
 def test_the_fallback_is_not_nfkc(tmp_path):

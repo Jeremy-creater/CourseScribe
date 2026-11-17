@@ -1389,9 +1389,13 @@ def test_sleep_warning_goes_away_when_the_work_is_over(rig):
     assert SLEEP_WARNING not in rig.controller.state.notice
 
 
-def test_mac_keep_awake_can_be_used_and_never_fails():
+def test_mac_keep_awake_can_be_used_and_never_fails(monkeypatch):
+    import sys
+
     from coursescribe.platform import macos
 
+    # ``caffeinate`` only exists on a Mac: a sleeping Python stands in for it, so this runs anywhere.
+    monkeypatch.setattr(macos, "caffeinate_command", lambda pid: [sys.executable, "-c", "import time; time.sleep(60)"])
     keep_awake = macos.create_keep_awake()
     assert [keep_awake.hold(), keep_awake.hold(), keep_awake.release(), keep_awake.release()] == [None] * 4
 
