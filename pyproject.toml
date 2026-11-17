@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +7,8 @@ name = "coursescribe"
 version = "0.1.0"
 description = "Record a course or pick a media file, and get a full proofread transcript. Runs locally."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "av>=17,<18",  # faster-whisper 1.2 passes an option that av 19 removed
