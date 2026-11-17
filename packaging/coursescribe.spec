@@ -37,6 +37,7 @@ analysis = Analysis(
     + mac_datas
     + [
         (str(ROOT / "src" / "coursescribe" / "ui" / "chevron.svg"), "coursescribe/ui"),
+        (str(ROOT / "src" / "coursescribe" / "ui" / "app-icon.png"), "coursescribe/ui"),
         # Beside notes_rules.py, where SHIPPED_RULES looks for it.
         (str(ROOT / "src" / "coursescribe" / "notes_rules.txt"), "coursescribe"),
     ],

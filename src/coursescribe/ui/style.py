@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtGui import QColor, QFontDatabase, QPalette
+from PySide6.QtGui import QColor, QFontDatabase, QIcon, QPalette
 from PySide6.QtWidgets import QApplication, QWidget
 
 COLORS = {
@@ -32,6 +32,11 @@ _C = COLORS
 # Shipped next to this file; the packaging spec copies it. Once a combo box is
 # styled, Qt draws no arrow unless it is given an image.
 ARROW_IMAGE = Path(__file__).with_name("chevron.svg")
+ICON_IMAGE = Path(__file__).with_name("app-icon.png")
+
+
+def app_icon() -> QIcon:
+    return QIcon(str(ICON_IMAGE))
 STYLE_SHEET = f"""
 QWidget {{
     color: {_C["text"]};

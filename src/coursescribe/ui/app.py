@@ -34,7 +34,7 @@ from coursescribe.settings import app_home, open_settings
 from coursescribe.shortcut import InvalidShortcut, parse
 from coursescribe.transcribe import WhisperTranscriber, download_whisper_model
 from coursescribe.ui.main_window import FILE_DIALOG_TITLE, FILE_FILTER, MainWindow
-from coursescribe.ui.style import apply_style
+from coursescribe.ui.style import app_icon, apply_style
 from coursescribe.vocabulary import FILE_NAME as WORD_LIST_FILE
 from coursescribe.vocabulary import load_vocabulary
 
@@ -112,6 +112,7 @@ def run() -> int:
 
     app = QApplication([])
     apply_style(app)
+    app.setWindowIcon(app_icon())
     lock = QLockFile(str(home / "running.lock"))
     if not lock.tryLock(0):
         QMessageBox.information(None, "CourseScribe", "CourseScribe 已经打开了。")
