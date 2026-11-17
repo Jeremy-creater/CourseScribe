@@ -5,7 +5,13 @@ from __future__ import annotations
 from no_skip_plugin import pytest_runtest_makereport  # noqa: F401  (registers the hook)
 
 
+import sys  # noqa: E402
+
 import pytest  # noqa: E402
+
+# These files drive a real Mac (Core Audio, Carbon shortcuts, caffeinate). On any other system they
+# cannot even be imported, so they are left out of collection there. On a Mac they run with the gui group.
+collect_ignore_glob = [] if sys.platform == "darwin" else ["test_mac_*_desktop.py"]
 
 
 @pytest.fixture(autouse=True)
