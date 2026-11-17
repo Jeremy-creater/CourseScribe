@@ -342,7 +342,7 @@ def test_catalog_has_the_default_and_every_entry_states_its_size():
     assert model_size_label("unknown-model") == "大小未知"
 
 
-# --- the GPU cannot be used this time (docs/plans/M2-gpu-fallback-tests.md) ---
+# --- the GPU cannot be used this time ---
 
 AUDIO_SECONDS = 5.0
 SCRIPT = [RawSegment(float(i), float(i + 1), f"第{i}句") for i in range(5)]

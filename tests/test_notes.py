@@ -1798,7 +1798,6 @@ def test_very_long_sources_and_replies_finish_quickly():
 
 
 # ---------------------------------------------------------------- source_body and build_prompt (12-4)
-# docs/plans/M2-notes-4-rules-tests.md
 
 PROMPT_HEAD = "\n\n【校对稿开始】下面是这节课的原文，笔记里的引述和概念只能来自这里。\n"
 PROMPT_TAIL = "\n【校对稿结束】请按上面的整理规则写这节课的笔记，只返回笔记正文。"

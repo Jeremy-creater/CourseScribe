@@ -862,7 +862,7 @@ class TestResumingGivesTheSameResult:
         assert result.unproofread_chunks == 0
 
 
-# --- M2 item 11: the word list during proofreading (docs/plans/M2-vocabulary-tests.md) ---
+# --- M2 item 11: the word list during proofreading ---
 
 LATIN_1_WORD_LIST = "café -> Café".encode("latin-1")
 
@@ -1075,7 +1075,7 @@ def test_real_ollama_timing_out_waits_and_resumes_to_complete_text(tmp_path):
     assert is_lossless(text, result.markdown)
 
 
-# --- Limits and cut-off answers (M2 notes step 1; matrix: docs/plans/M2-notes-1-ollama-tests.md) ---
+# --- Limits and cut-off answers (M2 notes step 1) ---
 
 STOP = {"done": True, "done_reason": "stop"}
 CUT = {"done": True, "done_reason": "length"}

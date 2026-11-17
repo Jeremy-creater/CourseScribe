@@ -164,8 +164,7 @@ def _names_tempfile(path: Path) -> bool:
 def test_program_code_never_imports_tempfile():
     offenders = [p.name for p in SRC.rglob("*.py") if _names_tempfile(p)]
     assert offenders == [], (
-        f"{offenders}: on Windows tempfile retries without end in a folder that refuses new files; "
-        "see docs/plans/M2-write-permission-hang-tests.md"
+        f"{offenders}: on Windows tempfile retries without end in a folder that refuses new files"
     )
 
 def _tracked_files() -> list[str]:

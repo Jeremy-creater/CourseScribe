@@ -83,7 +83,7 @@ def test_a_file_saved_by_notepad_with_a_bom_reads_cleanly(tmp_path):
     assert load_vocabulary(path) == Vocabulary(("践行",), (("见行", "践行"),))
 
 
-# --- M2 item 11: reading, encodings, whole-word fixes (docs/plans/M2-vocabulary-tests.md) ---
+# --- M2 item 11: reading, encodings, whole-word fixes ---
 
 # All in GB2312. 浏洹浒澶 have GBK lead bytes E4/E5, the start of a three-byte UTF-8 character,
 # so GBK lists such as "浏电保" are also valid UTF-8 (review M1).

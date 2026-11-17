@@ -1,6 +1,6 @@
 """The rules for organised notes: the user's file, the shipped copy, and how they are read and created.
 
-M2 item 12-4 (docs/plans/M2-notes-4-rules-tests.md).
+M2 item 12-4.
 """
 
 from __future__ import annotations

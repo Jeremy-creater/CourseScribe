@@ -29,3 +29,6 @@ coverage*.json
 
 # icon drafts (the chosen one lives in packaging/icons)
 /icon/
+
+# The working rules stay on the author's computers (a private notes repository keeps a copy)
+/CLAUDE.md

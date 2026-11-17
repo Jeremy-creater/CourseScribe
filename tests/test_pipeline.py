@@ -323,7 +323,7 @@ def test_checkpoints_are_removed_after_finishing(tmp_path):
     assert not store.proofread_path(job).exists()
 
 
-# --- transcript moved away before proofreading (docs/plans/M2-moved-transcript-tests.md) ---
+# --- transcript moved away before proofreading ---
 
 
 def test_transcript_deleted_before_proofreading_is_written_again_from_the_checkpoint(tmp_path):
@@ -456,7 +456,7 @@ def test_slow_proofreading_service_waits_then_resumes_into_one_md(tmp_path):
     assert final.txt_path.read_bytes() == expected_txt
 
 
-# --- the GPU cannot be used this time (docs/plans/M2-gpu-fallback-tests.md) ---
+# --- the GPU cannot be used this time ---
 # The real WhisperTranscriber, with stand-ins only for the engine and the graphics driver.
 
 GENERIC_FAILURE = "处理时出错了。录音和已有文件都还在，详情见日志。"
@@ -629,7 +629,7 @@ def test_closed_while_on_the_cpu_restarts_on_the_gpu_without_repeating_or_missin
     assert sorted(p.name for p in final.folder.iterdir()) == ["课.md", "课.txt"]
 
 
-# --- M2 item 11: the word list never touches the .txt (docs/plans/M2-vocabulary-tests.md) ---
+# --- M2 item 11: the word list never touches the .txt ---
 
 WORDS = "见行 → 践行\njava → Java\n"
 LESSON = ["我们讲见行", "用了 java 和 javascript", "java编程"]

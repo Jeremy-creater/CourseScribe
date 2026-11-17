@@ -104,7 +104,7 @@ def test_store_on_a_missing_folder_is_empty(tmp_path):
     assert JobStore(tmp_path / "nothing").load_all() == []
 
 
-# --- long names (docs/plans/M2-long-names-tests.md) ---
+# --- long names ---
 
 OUT = Path("C:/out")
 _ALPHABET = ["a", "讲", "😀", "e", "\u0301", "\u200d", "\ufe0f", "🏽", " ", "."]

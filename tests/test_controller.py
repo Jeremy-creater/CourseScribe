@@ -695,7 +695,7 @@ def test_recording_with_no_sound_is_not_offered_for_retry(rig, content):
     assert job.audio_path.read_bytes() == before
 
 
-# --- recording that cannot be opened for repair (docs/plans/M2-held-recording-tests.md) ---
+# --- recording that cannot be opened for repair ---
 
 
 def _interrupted_recording(rig, extra=b""):
@@ -1059,7 +1059,7 @@ def test_retry_and_ignore_with_unwritable_job_records_say_why(rig, action, stage
     assert rig.controller.state.pending == 0
 
 
-# --- keeping the computer awake (docs/plans/M2-keep-awake-tests.md) ---
+# --- keeping the computer awake ---
 
 
 def _gate(rig):
@@ -1405,7 +1405,7 @@ def test_unexpected_error_is_reported_in_plain_words(rig):
     assert "日志" in rig.controller.state.notice
 
 
-# --- long names (docs/plans/M2-long-names-tests.md) ---
+# --- long names ---
 
 
 def _u16(text):
@@ -1485,7 +1485,7 @@ def test_cut_name_is_kept_when_the_job_resumes_after_a_restart(tmp_path, monkeyp
     second.check_keep_awake_follows_busy()
 
 
-# --- transcript moved, held or re-saved before proofreading (docs/plans/M2-moved-transcript-tests.md) ---
+# --- transcript moved, held or re-saved before proofreading ---
 
 
 NORMAL_MD = "# 第一课\n\n第一课的内容。\n"
@@ -1660,7 +1660,7 @@ def test_retrying_an_unsolved_transcript_problem_says_the_same_and_touches_nothi
         )
 
 
-# --- the GPU cannot be used this time (docs/plans/M2-gpu-fallback-tests.md) ---
+# --- the GPU cannot be used this time ---
 
 
 def _transcription_statuses(statuses: list[str], start: int) -> list[str]:
@@ -1705,7 +1705,7 @@ def test_gpu_fallback_is_explained_for_that_file_only_and_the_next_file_has_the_
     rig.check_keep_awake_follows_busy()
 
 
-# --- M2 item 11: an unreadable word list (docs/plans/M2-vocabulary-tests.md) ---
+# --- M2 item 11: an unreadable word list ---
 
 
 def test_an_unreadable_word_list_fails_for_retry_says_the_same_each_time_and_finishes_once_fixed(tmp_path):

@@ -208,7 +208,7 @@ def test_json_read_gives_up_on_a_file_that_stays_held(tmp_path, monkeypatch, fil
         read_json(target)
 
 
-# --- reading back a transcript the user may have moved, held or re-saved (docs/plans/M2-moved-transcript-tests.md) ---
+# --- reading back a transcript the user may have moved, held or re-saved ---
 
 TRANSCRIPT_TEXTS = [
     "第一句，讲 Python 的 list。\n第二句 😀\n",

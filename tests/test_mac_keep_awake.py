@@ -1,7 +1,7 @@
 """The Mac keeps the computer awake with a ``caffeinate`` process that lives exactly as long as the request.
 
 ``caffeinate`` itself only exists on a Mac, so these run a real stand-in process (a sleeping Python) in its place.
-What stays for the Mac: that the computer really does not sleep, see docs/acceptance-mac.md.
+What stays for the Mac: that the computer really does not sleep.
 """
 
 from __future__ import annotations

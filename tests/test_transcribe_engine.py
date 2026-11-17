@@ -132,7 +132,7 @@ def test_release_gives_gpu_memory_back(spoken_wav):
     assert after - before < 300
 
 
-# --- the GPU cannot be used this time (docs/plans/M2-gpu-fallback-tests.md) ---
+# --- the GPU cannot be used this time ---
 
 _OLLAMA_PS = "http://127.0.0.1:11434/api/ps"
 _FREE_ENOUGH_MB = 3072  # the desktop itself uses about 1.5 GB
