@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import plistlib
 import re
 import shutil
 import subprocess
@@ -63,6 +64,8 @@ def _license_files(dist: importlib.metadata.Distribution):
         if not parts[0].endswith(".dist-info"):
             continue
         inner = Path(*parts[1:])
+        if "__pycache__" in inner.parts:  # pip's bytecode of a licenses/*.py records the install path
+            continue
         if inner.parts[0] == "licenses" or (len(inner.parts) == 1 and LICENSE_FILE.search(file.name)):
             found = True
             yield inner, file
@@ -102,6 +105,13 @@ def copy_licenses(dest: Path) -> int:
     return len(copied)
 
 
+def stamp_version(plist: Path, value: str) -> None:
+    """Put the release version in the app's Info.plist (PyInstaller writes 0.0.0)."""
+    data = plistlib.loads(plist.read_bytes())
+    data["CFBundleShortVersionString"] = data["CFBundleVersion"] = value
+    plist.write_bytes(plistlib.dumps(data))
+
+
 def run_pyinstaller(dist: Path, work: Path) -> None:
     subprocess.run(
         [
@@ -137,6 +147,7 @@ def build_mac(out: Path) -> Path:
     for extra in LICENSE_FILES:
         shutil.copy2(extra, resources / extra.name)
     print(f"{copy_licenses(resources / 'licenses')} license files")
+    stamp_version(app / "Contents" / "Info.plist", version())
     # New files break the seal PyInstaller signed .
     subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(app)], check=True)
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
